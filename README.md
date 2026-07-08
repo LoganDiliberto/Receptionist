@@ -79,8 +79,11 @@ instead of a phone, so you can test changes without making a phone call.
 
 | File | Job |
 |---|---|
-| `server.py` | The web server. Accepts incoming calls (from the browser or from Twilio), sets up a transport for each call, and starts a bot to run the conversation. |
+| `server.py` | The web server. Accepts incoming calls (from the browser or from Twilio), sets up a transport for each call, and starts a bot to run the conversation. Also serves the admin UI and its REST API. |
 | `bot.py` | Defines the voice pipeline — the chain of components that turn caller audio into a reply. Transport-agnostic, so the same bot works for browser tests and real phone calls. |
+| `salon.py` | The salon data layer. Reads and writes `ReceptionistData.xlsx` (hours, staff, services, schedules, appointments) and exposes the two async tools (`check_availability`, `book_appointment`) the LLM calls, plus CRUD helpers used by the admin API. |
+| `admin_api.py` | FastAPI router mounted at `/api` that exposes staff/services/hours/appointments CRUD to the admin UI. |
+| `admin-ui/` | Angular admin console (built with `npm run build`; served by FastAPI at `/admin`). |
 | `static/index.html` | A small webpage that lets you "call" the bot from your browser for testing. |
 | `voices/` | The Piper text-to-speech voice files. |
 | `logs/server.log` | Everything the program logs, rotated. Useful when something breaks. |
@@ -124,6 +127,58 @@ instead of a phone, so you can test changes without making a phone call.
 4. In the Twilio Console, open your number's settings. For "A call comes in",
    set the webhook to `https://<your-ngrok-url>/voice` (POST).
 5. Dial your Twilio number from any phone.
+
+---
+
+## Admin console (Angular)
+
+The `admin-ui/` folder holds a small single-page Angular app that lets a
+manager edit staff, services, hours, and the appointment calendar directly
+without touching Excel. It talks to the FastAPI server over `/api/*`, which
+persists changes back into the same `ReceptionistData.xlsx` workbook the bot
+reads on startup — so an edit made in the UI is picked up by the next call.
+
+### First-time setup
+
+```
+cd admin-ui
+npm install
+npm run build
+```
+
+The build writes to `admin-ui/dist/admin-ui/browser/`. When the FastAPI
+server sees that folder exists, it serves the compiled app at
+`http://<host>:7860/admin/` and returns any deep link (e.g. `/admin/staff`)
+back to `index.html` so the Angular router can handle it.
+
+### Day-to-day development
+
+Run the API and the Angular dev server in two terminals:
+
+```
+# terminal 1 — API + voice bot
+.venv\Scripts\python.exe server.py
+
+# terminal 2 — Angular dev server with live reload
+cd admin-ui
+npm start
+```
+
+Then open `http://127.0.0.1:4200/`. The dev server proxies API calls to the
+FastAPI server on port 7860; CORS for `localhost:4200` is already configured
+in `server.py`.
+
+### What the pages do
+
+- **Dashboard** — quick counts of staff, services, and appointments plus the
+  salon's location.
+- **Staff** — add, edit, or remove staff members; pick which services they
+  offer and set their weekly schedule.
+- **Services** — add, edit, or remove services and their duration and price.
+  Services live in a `Services` sheet created automatically on first boot.
+- **Calendar** — a week-at-a-glance grid of upcoming appointments. Click any
+  day to add a new booking, or click an existing appointment to edit or
+  cancel it. Uses the same conflict-detection logic the voice bot does.
 
 ---
 

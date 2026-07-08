@@ -21,9 +21,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, Request, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
+
+from admin_api import router as admin_router
 
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.transports.base_transport import BaseTransport, TransportParams
@@ -47,6 +50,8 @@ ROOT = Path(__file__).parent
 STATIC_DIR = ROOT / "static"
 LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
+# Built Angular admin app. Empty until you run `npm run build` in admin-ui/.
+ADMIN_DIST = ROOT / "admin-ui" / "dist" / "admin-ui" / "browser"
 
 
 def _is_transcript(record) -> bool:
@@ -95,7 +100,54 @@ WEBRTC_SAMPLE_RATE = 16000
 TWILIO_SAMPLE_RATE = 8000
 
 app = FastAPI(title="Funkle Receptionist")
+
+# The Angular dev server runs on 4200; allow it (and any localhost origin
+# during development) to talk to the API. Same-origin requests from the
+# built /admin app aren't affected by this middleware.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:4200",
+        "http://127.0.0.1:4200",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.include_router(admin_router)
+
+
+# ---------- Admin UI (built Angular app) ----------
+
+
+if ADMIN_DIST.exists():
+    @app.get("/admin", include_in_schema=False)
+    @app.get("/admin/{path:path}", include_in_schema=False)
+    async def _admin_spa(path: str = "") -> Response:
+        # Serve a real file when it exists (JS bundle, CSS, favicon, etc).
+        # Otherwise fall through to index.html so Angular's client-side router
+        # can handle deep links like /admin/staff on a hard refresh.
+        if path:
+            candidate = (ADMIN_DIST / path).resolve()
+            if candidate.is_file() and ADMIN_DIST.resolve() in candidate.parents:
+                return FileResponse(candidate)
+        return FileResponse(ADMIN_DIST / "index.html")
+else:
+    @app.get("/admin", include_in_schema=False)
+    @app.get("/admin/{_path:path}", include_in_schema=False)
+    async def _admin_not_built(_path: str = "") -> Response:
+        return Response(
+            content=(
+                "Admin UI is not built yet.\n"
+                "Run:\n"
+                "  cd admin-ui && npm install && npm run build\n"
+            ),
+            media_type="text/plain",
+            status_code=503,
+        )
+
 
 webrtc_handler = SmallWebRTCRequestHandler()
 

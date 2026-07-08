@@ -8,3 +8,9 @@ voices/*.onnx
 voices/*.onnx.json
 .pytest_cache/
 .cache/
+
+# Angular admin UI
+admin-ui/node_modules/
+admin-ui/dist/
+admin-ui/.angular/
+admin-ui/out-tsc/
