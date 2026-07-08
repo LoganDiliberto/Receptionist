@@ -160,6 +160,14 @@ async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> FileResponse:
+    # Browsers request /favicon.ico by default even when the page doesn't
+    # reference it. We serve the SVG at that URL with the right media type;
+    # all modern browsers accept an SVG favicon.
+    return FileResponse(STATIC_DIR / "favicon.svg", media_type="image/svg+xml")
+
+
 @app.post("/offer")
 async def offer(request: SmallWebRTCRequest, background: BackgroundTasks) -> dict:
     async def on_connection(conn: SmallWebRTCConnection) -> None:

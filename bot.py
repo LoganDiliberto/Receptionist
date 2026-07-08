@@ -206,29 +206,43 @@ def _build_tools_schema() -> ToolsSchema:
     ])
 
 
-async def _handle_check_availability(params: FunctionCallParams) -> None:
-    args = params.arguments
-    result = await salon.check_availability(
-        date_iso=args["date_iso"],
-        stylist=args.get("stylist"),
-        service=args.get("service"),
-    )
-    logger.info(f"check_availability({args}) -> {result}")
-    await params.result_callback(result)
+def _make_tool_handlers(session_id: str):
+    """Build tool handlers that close over the current session id.
 
+    Defining these inside `run_bot` (via this factory) gives us a clean way
+    to attach the per-call session id to every appointment the LLM books —
+    without having to thread it through the LLM's own arguments.
+    """
 
-async def _handle_book_appointment(params: FunctionCallParams) -> None:
-    args = params.arguments
-    result = await salon.book_appointment(
-        customer_name=args["customer_name"],
-        customer_phone=args["customer_phone"],
-        stylist=args["stylist"],
-        service=args["service"],
-        date_iso=args["date_iso"],
-        time_str=args["time_str"],
-    )
-    logger.info(f"book_appointment({args}) -> {result}")
-    await params.result_callback(result)
+    async def check_availability(params: FunctionCallParams) -> None:
+        args = params.arguments
+        result = await salon.check_availability(
+            date_iso=args["date_iso"],
+            stylist=args.get("stylist"),
+            service=args.get("service"),
+        )
+        logger.bind(session=session_id).info(
+            f"check_availability({args}) -> {result}"
+        )
+        await params.result_callback(result)
+
+    async def book_appointment(params: FunctionCallParams) -> None:
+        args = params.arguments
+        result = await salon.book_appointment(
+            customer_name=args["customer_name"],
+            customer_phone=args["customer_phone"],
+            stylist=args["stylist"],
+            service=args["service"],
+            date_iso=args["date_iso"],
+            time_str=args["time_str"],
+            session_id=session_id,
+        )
+        logger.bind(session=session_id).info(
+            f"book_appointment({args}) -> {result}"
+        )
+        await params.result_callback(result)
+
+    return check_availability, book_appointment
 
 
 async def run_bot(transport: BaseTransport, *, sample_rate: int) -> None:
@@ -271,8 +285,9 @@ async def run_bot(transport: BaseTransport, *, sample_rate: int) -> None:
     llm = OpenAILLMService(
         settings=OpenAILLMService.Settings(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
     )
-    llm.register_function("check_availability", _handle_check_availability)
-    llm.register_function("book_appointment", _handle_book_appointment)
+    check_availability_tool, book_appointment_tool = _make_tool_handlers(session_id)
+    llm.register_function("check_availability", check_availability_tool)
+    llm.register_function("book_appointment", book_appointment_tool)
 
     tts = PiperTTSService(
         settings=PiperTTSService.Settings(voice=os.getenv("PIPER_VOICE", "en_US-amy-medium")),

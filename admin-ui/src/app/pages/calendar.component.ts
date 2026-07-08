@@ -1,5 +1,6 @@
 import { CommonModule } from '@angular/common';
 import { Component, Inject, OnInit, computed, inject, signal } from '@angular/core';
+import { ActivatedRoute } from '@angular/router';
 import {
   FormBuilder,
   FormGroup,
@@ -250,6 +251,7 @@ export class CalendarComponent implements OnInit {
   private readonly api = inject(ApiService);
   private readonly dialog = inject(MatDialog);
   private readonly snack = inject(MatSnackBar);
+  private readonly route = inject(ActivatedRoute);
 
   readonly today = toIso(new Date());
   readonly weekStart = signal(startOfWeek(this.today));
@@ -298,7 +300,15 @@ export class CalendarComponent implements OnInit {
 
   ngOnInit(): void {
     this.loadStaticData();
-    this.refresh();
+    // Support "?date=YYYY-MM-DD" so links from the Calls page (or anywhere)
+    // can jump the calendar to a specific week.
+    this.route.queryParamMap.subscribe((params) => {
+      const target = params.get('date');
+      if (target && /^\d{4}-\d{2}-\d{2}$/.test(target)) {
+        this.weekStart.set(startOfWeek(target));
+      }
+      this.refresh();
+    });
   }
 
   private loadStaticData(): void {

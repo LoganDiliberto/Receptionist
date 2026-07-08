@@ -47,6 +47,10 @@ import { MatListModule } from '@angular/material/list';
             <mat-icon matListItemIcon>event</mat-icon>
             <span matListItemTitle>Calendar</span>
           </a>
+          <a mat-list-item routerLink="/calls" routerLinkActive="active-link">
+            <mat-icon matListItemIcon>phone_in_talk</mat-icon>
+            <span matListItemTitle>Calls</span>
+          </a>
         </mat-nav-list>
       </mat-sidenav>
       <mat-sidenav-content>

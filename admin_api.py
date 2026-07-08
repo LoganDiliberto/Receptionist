@@ -13,6 +13,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+import calls
 import salon
 
 router = APIRouter(prefix="/api", tags=["admin"])
@@ -88,7 +89,24 @@ async def summary() -> dict:
         "staff_count": len(salon.INFO.stylists),
         "service_count": len(salon.INFO.services),
         "appointment_count": len(await _run(salon.list_appointments)),
+        "call_count": len(await _run(calls.list_calls)),
     }
+
+
+# ---------- Calls (observability) ----------
+
+
+@router.get("/calls")
+async def get_calls() -> list[dict]:
+    return await _run(calls.list_calls)
+
+
+@router.get("/calls/{session_id}")
+async def get_call_detail(session_id: str) -> dict:
+    call = await _run(calls.get_call, session_id)
+    if call is None:
+        raise HTTPException(status_code=404, detail=f"Call {session_id!r} not found.")
+    return call
 
 
 # ---------- Staff ----------

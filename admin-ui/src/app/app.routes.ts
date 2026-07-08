@@ -26,5 +26,11 @@ export const APP_ROUTES: Routes = [
       import('./pages/calendar.component').then((m) => m.CalendarComponent),
     title: 'Calendar',
   },
+  {
+    path: 'calls',
+    loadComponent: () =>
+      import('./pages/calls.component').then((m) => m.CallsComponent),
+    title: 'Calls',
+  },
   { path: '**', redirectTo: '' },
 ];

@@ -146,11 +146,16 @@ class SalonInfo:
 _APPT_COLUMNS = [
     "id", "created_at", "customer_name", "customer_phone",
     "stylist", "service", "date", "start_time", "end_time",
+    "session_id",
 ]
 
 
 def _ensure_workbook_shape() -> None:
-    """Make sure every sheet we depend on exists, seeding sane defaults."""
+    """Make sure every sheet we depend on exists, seeding sane defaults.
+
+    Also migrates the Appointments sheet in-place when we've added new columns
+    (like `session_id`) so older workbooks keep working after an upgrade.
+    """
     with _lock:
         wb = openpyxl.load_workbook(SALON_XLSX)
         dirty = False
@@ -159,6 +164,17 @@ def _ensure_workbook_shape() -> None:
             ws = wb.create_sheet("Appointments")
             ws.append(_APPT_COLUMNS)
             dirty = True
+        else:
+            ws = wb["Appointments"]
+            header = [cell.value for cell in ws[1]] if ws.max_row >= 1 else []
+            missing = [c for c in _APPT_COLUMNS if c not in header]
+            if missing:
+                # openpyxl's `Cell` doesn't let us insert columns portably, so
+                # we just append the new header names on the end and let the
+                # matching rows stay blank until they're written.
+                for i, col in enumerate(missing):
+                    ws.cell(row=1, column=len(header) + 1 + i, value=col)
+                dirty = True
 
         if "Services" not in wb.sheetnames:
             ws = wb.create_sheet("Services")
@@ -304,7 +320,7 @@ def _append_appointment(appt: dict) -> None:
     with _lock:
         wb = openpyxl.load_workbook(SALON_XLSX)
         ws = wb["Appointments"]
-        ws.append([appt[k] for k in _APPT_COLUMNS])
+        ws.append([appt.get(k) for k in _APPT_COLUMNS])
         wb.save(SALON_XLSX)
 
 
@@ -470,12 +486,19 @@ async def book_appointment(
     service: str,
     date_iso: str,
     time_str: str,
+    session_id: str | None = None,
 ) -> dict:
-    """Book and persist an appointment after re-checking availability."""
+    """Book and persist an appointment after re-checking availability.
+
+    `session_id` is the bot's per-call session identifier; when supplied it's
+    stored on the appointment so the observability UI can link a call to the
+    booking it produced.
+    """
     async with _async_lock:
         return await asyncio.to_thread(
             _book_appointment_sync,
             customer_name, customer_phone, stylist, service, date_iso, time_str,
+            session_id,
         )
 
 
@@ -486,6 +509,7 @@ def _book_appointment_sync(
     service: str,
     date_iso: str,
     time_str: str,
+    session_id: str | None = None,
 ) -> dict:
     try:
         d = _parse_date(date_iso)
@@ -549,6 +573,7 @@ def _book_appointment_sync(
         "date": date_iso,
         "start_time": start.strftime("%H:%M"),
         "end_time": end.strftime("%H:%M"),
+        "session_id": session_id,
     })
 
     return {

@@ -80,9 +80,11 @@ instead of a phone, so you can test changes without making a phone call.
 | File | Job |
 |---|---|
 | `server.py` | The web server. Accepts incoming calls (from the browser or from Twilio), sets up a transport for each call, and starts a bot to run the conversation. Also serves the admin UI and its REST API. |
+| `run.py` | Convenience launcher: spawns `server.py` and `ngrok http 7860` together and prints the public URL you paste into Twilio. Also `run.cmd` for a shorter double-click / one-word invocation on Windows. |
 | `bot.py` | Defines the voice pipeline — the chain of components that turn caller audio into a reply. Transport-agnostic, so the same bot works for browser tests and real phone calls. |
 | `salon.py` | The salon data layer. Reads and writes `ReceptionistData.xlsx` (hours, staff, services, schedules, appointments) and exposes the two async tools (`check_availability`, `book_appointment`) the LLM calls, plus CRUD helpers used by the admin API. |
-| `admin_api.py` | FastAPI router mounted at `/api` that exposes staff/services/hours/appointments CRUD to the admin UI. |
+| `calls.py` | Parses `logs/transcripts.log` into structured call records and links each call to the appointment it produced (via the `session_id` column). |
+| `admin_api.py` | FastAPI router mounted at `/api` that exposes staff/services/hours/appointments/calls to the admin UI. |
 | `admin-ui/` | Angular admin console (built with `npm run build`; served by FastAPI at `/admin`). |
 | `static/index.html` | A small webpage that lets you "call" the bot from your browser for testing. |
 | `voices/` | The Piper text-to-speech voice files. |
@@ -118,11 +120,23 @@ instead of a phone, so you can test changes without making a phone call.
 
 ### Real phone call
 
-1. Start the server (same command as above).
-2. In a second terminal, start ngrok pointing at port 7860:
-   ```
-   ngrok http 7860
-   ```
+The easy way — one command starts both the server and ngrok, prints the
+public URL you need for Twilio, and shuts everything down on Ctrl+C:
+
+```
+run
+```
+
+(or `.venv\Scripts\python.exe run.py` if you'd rather not use the `.cmd`
+shortcut.) Copy the printed `Twilio webhook` URL into your Twilio number's
+"A call comes in" webhook (POST) in the Twilio Console, then dial the
+number. See `run.py` — it wraps `server.py` and `ngrok http 7860` so you
+don't have to babysit two terminals.
+
+If you'd rather run them yourself:
+
+1. Start the server: `.venv\Scripts\python.exe server.py`
+2. In a second terminal: `ngrok http 7860`
 3. Copy the `https://*.ngrok-free.app` URL ngrok shows.
 4. In the Twilio Console, open your number's settings. For "A call comes in",
    set the webhook to `https://<your-ngrok-url>/voice` (POST).
@@ -179,6 +193,12 @@ in `server.py`.
 - **Calendar** — a week-at-a-glance grid of upcoming appointments. Click any
   day to add a new booking, or click an existing appointment to edit or
   cancel it. Uses the same conflict-detection logic the voice bot does.
+- **Calls** — an observability view of every call the bot has answered.
+  Each row shows when the call happened, how long it lasted, how many turns
+  it took, and whether it resulted in a booking. Click a row for the full
+  transcript and a "view in calendar" link to any appointment the call
+  produced. Data is derived from `logs/transcripts.log` plus the
+  `session_id` column the bot now stamps on every appointment it books.
 
 ---
 

@@ -63,6 +63,17 @@ import { ApiService, Summary } from '../api.service';
               <div class="tile-sub">On the calendar</div>
             </mat-card-content>
           </mat-card>
+
+          <mat-card class="tile" routerLink="/calls">
+            <mat-card-content>
+              <div class="tile-header">
+                <mat-icon>phone_in_talk</mat-icon>
+                <span class="tile-label">Calls</span>
+              </div>
+              <div class="tile-value">{{ s.call_count }}</div>
+              <div class="tile-sub">Handled by the bot</div>
+            </mat-card-content>
+          </mat-card>
         </div>
 
         <mat-card class="location-card">

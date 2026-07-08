@@ -54,6 +54,31 @@ export interface Summary {
   staff_count: number;
   service_count: number;
   appointment_count: number;
+  call_count: number;
+}
+
+export type CallOutcome = 'booked' | 'no_booking';
+
+export interface CallSummary {
+  session_id: string;
+  started_at: string;
+  ended_at: string;
+  duration_seconds: number;
+  turn_count: number;
+  user_turn_count: number;
+  outcome: CallOutcome;
+  appointment_ids: string[];
+}
+
+export interface CallTurn {
+  at: string;
+  role: 'user' | 'assistant';
+  text: string;
+}
+
+export interface CallDetail extends CallSummary {
+  turns: CallTurn[];
+  appointments: Appointment[];
 }
 
 /**
@@ -134,6 +159,16 @@ export class ApiService {
   updateLocation(location: string): Observable<{ location: string }> {
     return this.http
       .put<{ location: string }>(`${this.base}/location`, { location })
+      .pipe(catchError(handle));
+  }
+
+  // --- Calls ---
+  listCalls(): Observable<CallSummary[]> {
+    return this.http.get<CallSummary[]>(`${this.base}/calls`).pipe(catchError(handle));
+  }
+  getCall(sessionId: string): Observable<CallDetail> {
+    return this.http
+      .get<CallDetail>(`${this.base}/calls/${encodeURIComponent(sessionId)}`)
       .pipe(catchError(handle));
   }
 
