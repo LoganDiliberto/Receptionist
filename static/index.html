@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Funkle Receptionist</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 560px; margin: 4rem auto; padding: 0 1rem; color: #222; }
+    h1 { margin-bottom: 0.25rem; }
+    .sub { color: #666; margin-bottom: 2rem; }
+    button { font-size: 1.05rem; padding: 0.7rem 1.4rem; border-radius: 8px; border: 1px solid #333; background: #111; color: #fff; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #status { margin-top: 1.5rem; font-family: ui-monospace, monospace; white-space: pre-wrap; color: #333; }
+    .level { height: 8px; background: #eee; border-radius: 4px; margin-top: 1rem; overflow: hidden; }
+    .level > div { height: 100%; width: 0; background: linear-gradient(90deg, #4ade80, #f59e0b, #ef4444); transition: width 60ms linear; }
+  </style>
+</head>
+<body>
+  <h1>Funkle Receptionist</h1>
+  <div class="sub">Click <em>Start call</em>, allow microphone, and start talking.</div>
+
+  <button id="start">Start call</button>
+  <button id="stop" disabled>Hang up</button>
+  <div class="level"><div id="meter"></div></div>
+  <div id="status">idle</div>
+  <audio id="remote" autoplay></audio>
+
+  <script>
+    const startBtn = document.getElementById("start");
+    const stopBtn = document.getElementById("stop");
+    const statusEl = document.getElementById("status");
+    const remoteAudio = document.getElementById("remote");
+    const meter = document.getElementById("meter");
+
+    let pc, localStream, audioCtx, analyser, rafId;
+
+    function log(msg) {
+      statusEl.textContent = msg;
+      console.log(msg);
+    }
+
+    function startMeter(stream) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const src = audioCtx.createMediaStreamSource(stream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      src.connect(analyser);
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      const tick = () => {
+        analyser.getByteTimeDomainData(data);
+        let peak = 0;
+        for (const v of data) peak = Math.max(peak, Math.abs(v - 128));
+        meter.style.width = Math.min(100, (peak / 128) * 200) + "%";
+        rafId = requestAnimationFrame(tick);
+      };
+      tick();
+    }
+
+    async function start() {
+      startBtn.disabled = true;
+      log("requesting mic…");
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      startMeter(localStream);
+
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+      });
+
+      pc.ontrack = (e) => {
+        log("remote audio track received");
+        remoteAudio.srcObject = e.streams[0];
+      };
+      pc.onconnectionstatechange = () => log("pc state: " + pc.connectionState);
+
+      localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+
+      log("creating offer…");
+      const offer = await pc.createOffer({ offerToReceiveAudio: true });
+      await pc.setLocalDescription(offer);
+
+      // Wait for ICE gathering to complete so the offer contains all candidates.
+      await new Promise((resolve) => {
+        if (pc.iceGatheringState === "complete") return resolve();
+        const check = () => {
+          if (pc.iceGatheringState === "complete") {
+            pc.removeEventListener("icegatheringstatechange", check);
+            resolve();
+          }
+        };
+        pc.addEventListener("icegatheringstatechange", check);
+      });
+
+      log("posting offer to /offer…");
+      const resp = await fetch("/offer", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+      });
+      if (!resp.ok) {
+        log("server error: " + resp.status + " " + (await resp.text()));
+        startBtn.disabled = false;
+        return;
+      }
+      const answer = await resp.json();
+      await pc.setRemoteDescription(answer);
+      log("connected — start talking");
+      stopBtn.disabled = false;
+    }
+
+    async function stop() {
+      stopBtn.disabled = true;
+      cancelAnimationFrame(rafId);
+      if (pc) pc.close();
+      if (localStream) localStream.getTracks().forEach((t) => t.stop());
+      if (audioCtx) await audioCtx.close();
+      meter.style.width = "0";
+      log("hung up");
+      startBtn.disabled = false;
+    }
+
+    startBtn.onclick = () => start().catch((e) => log("error: " + e.message));
+    stopBtn.onclick = () => stop();
+  </script>
+</body>
+</html>
