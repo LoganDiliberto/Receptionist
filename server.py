@@ -163,9 +163,12 @@ async def index() -> FileResponse:
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon() -> FileResponse:
     # Browsers request /favicon.ico by default even when the page doesn't
-    # reference it. We serve the SVG at that URL with the right media type;
-    # all modern browsers accept an SVG favicon.
-    return FileResponse(STATIC_DIR / "favicon.svg", media_type="image/svg+xml")
+    # reference it. Serve the JPG favicon from the admin-ui source (which is
+    # the single source of truth) with the right media type.
+    return FileResponse(
+        ROOT / "admin-ui" / "src" / "favicon.jpg",
+        media_type="image/jpeg",
+    )
 
 
 @app.post("/offer")
