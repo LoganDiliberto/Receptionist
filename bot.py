@@ -1,7 +1,7 @@
 """Funkle receptionist bot.
 
 Builds and runs the voice pipeline for one call:
-  transport.input -> Silero VAD -> faster-whisper STT -> OpenAI LLM -> Piper TTS -> transport.output
+  transport.input -> Silero VAD -> Deepgram STT -> OpenAI LLM -> Piper TTS -> transport.output
 
 `run_bot(transport, sample_rate)` is transport-agnostic — `server.py` passes either
 a SmallWebRTCTransport (browser test client) or a FastAPIWebsocketTransport (Twilio).
@@ -10,49 +10,11 @@ a SmallWebRTCTransport (browser test client) or a FastAPIWebsocketTransport (Twi
 from __future__ import annotations
 
 import os
-import sys
 import uuid
+from datetime import date
 from pathlib import Path
 
 from loguru import logger
-
-
-def _add_nvidia_dll_dirs() -> None:
-    """Make CUDA DLLs from pip-installed nvidia-* wheels visible to ctranslate2.
-
-    On Windows, Python 3.8+ ignores PATH for native DLL resolution and requires
-    explicit `os.add_dll_directory()` calls. Without this, faster-whisper crashes
-    with "Library cublas64_12.dll is not found or cannot be loaded".
-    """
-    if sys.platform != "win32":
-        return
-    site_packages = Path(__file__).parent / ".venv" / "Lib" / "site-packages" / "nvidia"
-    import sysconfig
-    extra_root = Path(sysconfig.get_paths()["purelib"]) / "nvidia"
-    seen: set[str] = set()
-    for root in (site_packages, extra_root):
-        if not root.exists():
-            continue
-        for bin_dir in root.glob("*/bin"):
-            p = str(bin_dir)
-            if p in seen:
-                continue
-            seen.add(p)
-            try:
-                os.add_dll_directory(p)
-            except (FileNotFoundError, OSError) as e:
-                logger.warning(f"Could not add DLL dir {p}: {e}")
-            # ctranslate2's .pyd uses standard Windows DLL resolution for
-            # transitive deps (cublas -> cudart, cudnn -> cublas), which
-            # honors PATH but ignores add_dll_directory. So set both.
-            if p not in os.environ.get("PATH", "").split(os.pathsep):
-                os.environ["PATH"] = p + os.pathsep + os.environ.get("PATH", "")
-
-
-_add_nvidia_dll_dirs()
-
-
-from datetime import date
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
@@ -68,9 +30,9 @@ from pipecat.processors.aggregators.llm_response_universal import LLMContextAggr
 from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.llm_service import FunctionCallParams
+from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.piper.tts import PiperTTSService
-from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transports.base_transport import BaseTransport
 
 import salon
@@ -266,20 +228,24 @@ async def run_bot(transport: BaseTransport, *, sample_rate: int) -> None:
         )
     )
 
-    # Whisper tuning:
+    # Deepgram tuning:
+    # - model: nova-3-general handles both wideband (WebRTC 16 kHz) and phone
+    #   (Twilio 8 kHz μ-law → linear16) audio well. Override with DEEPGRAM_MODEL
+    #   to try nova-2-phonecall or another model if a specific accent trips it up.
     # - language=EN: pin to English so noisy phone audio can't drift detection.
-    # - no_speech_prob=0.8: a segment is KEPT when segment.no_speech_prob is
-    #   BELOW this threshold. Pipecat's default 0.4 is tuned for clean mic
-    #   audio; phone audio (8 kHz μ-law) has higher baseline no_speech doubt,
-    #   so we raise the bar to let real speech through.
-    stt = WhisperSTTService(
-        settings=WhisperSTTService.Settings(
-            model=os.getenv("WHISPER_MODEL", "small.en"),
+    # - smart_format=True: converts spoken numbers/dates/times to readable text
+    #   ("ten thirty" → "10:30") which the LLM parses more reliably.
+    # - interim_results=False: we already do end-of-turn detection with Silero VAD
+    #   below, so we only want committed transcripts flowing into the LLM.
+    stt = DeepgramSTTService(
+        api_key=os.environ["DEEPGRAM_API_KEY"],
+        settings=DeepgramSTTService.Settings(
+            model=os.getenv("DEEPGRAM_MODEL", "nova-3-general"),
             language=Language.EN,
-            no_speech_prob=0.8,
+            smart_format=True,
+            interim_results=False,
+            punctuate=True,
         ),
-        device="cuda",
-        compute_type="float16",
     )
 
     llm = OpenAILLMService(

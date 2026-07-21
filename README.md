@@ -32,7 +32,7 @@ hears it. All of this happens fast enough to feel like a normal conversation.
    │  1. Voice Activity Detection                     │
    │     "Is the caller speaking right now?"          │
    │                                                  │
-   │  2. Speech-to-Text  (faster-whisper, local GPU) │
+   │  2. Speech-to-Text  (Deepgram nova-3, cloud)     │
    │     Caller's audio → written words               │
    │                                                  │
    │  3. Language Model  (OpenAI gpt-4o-mini)         │
@@ -90,20 +90,32 @@ instead of a phone, so you can test changes without making a phone call.
 | `voices/` | The Piper text-to-speech voice files. |
 | `logs/server.log` | Everything the program logs, rotated. Useful when something breaks. |
 | `logs/transcripts.log` | Just the conversation transcripts. One line per turn. Useful for tuning. |
-| `.env` | Secrets and settings: your OpenAI API key, Twilio credentials, model choices. Not committed to git. |
+| `.env` | Secrets and settings: your OpenAI API key, Deepgram API key, Twilio credentials, model choices. Not committed to git. |
 | `.env.example` | A template showing what `.env` should contain. |
+| `Dockerfile` / `.dockerignore` | How production builds the container image (multi-stage: Angular build + Python runtime). |
+| `entrypoint.sh` | Container startup shim. Copies the seed workbook onto the persistent volume on first boot, then execs the server. |
+| `fly.toml` | Fly.io deployment config: region, machine size, port, and the persistent volume mount. |
+| `requirements.txt` | Python runtime dependencies pinned for reproducible deploys. |
+| `.github/workflows/deploy.yml` | CI/CD: merges to `main` deploy to Fly.io automatically. |
+| `.github/workflows/ci.yml` | Runs on every push and PR: Python syntax check + Angular build. |
 
 ---
 
 ## What you need to run it
 
-- A Windows PC with an NVIDIA GPU (3060-class or better).
-- Python 3.11.
+- Python 3.11 (any OS — Windows, macOS, Linux, or a Docker container).
 - An OpenAI API key.
+- A Deepgram API key (free $200 of credit at signup — plenty for testing).
 - A Twilio account with a phone number (for real calls — browser testing
   doesn't need this).
 - `ngrok` (so Twilio can reach your laptop over the public internet during
-  development).
+  development). Not needed in production — Fly.io gives us a stable URL.
+
+> Speech-to-text used to run locally on an NVIDIA GPU via faster-whisper.
+> The current pipeline uses Deepgram for STT, which means the app has no
+> GPU requirement and can be deployed to any commodity container host.
+> If you want to run STT locally again, revert `bot.py` to use
+> `WhisperSTTService` and re-install `pipecat-ai[whisper]`.
 
 ---
 
@@ -207,17 +219,17 @@ in `server.py`.
 Watch `logs/transcripts.log` after a bad call. You'll see what the program
 actually heard you say and what it actually replied. From there:
 
-- **It heard the wrong words.** Speech recognition needs help. Try a bigger
-  Whisper model (`WHISPER_MODEL=medium.en` or `large-v3-turbo` in `.env`),
-  or switch to a paid speech-to-text service like Deepgram which is built
-  for phone audio.
+- **It heard the wrong words.** Try a phone-tuned Deepgram model —
+  `DEEPGRAM_MODEL=nova-2-phonecall` is trained specifically on
+  narrow-band phone audio. If a specific accent trips it up, boost
+  key vocabulary via the `keywords` setting on `DeepgramSTTService`.
 - **It heard you correctly but said something dumb.** Use a smarter language
   model (`OPENAI_MODEL=gpt-4o` in `.env`).
 - **It cut you off mid-sentence.** Increase `stop_secs` in `bot.py` (the VAD
   setting). Higher means more pause tolerance, lower means snappier replies.
-- **It didn't hear you at all.** Lower `no_speech_prob` is *more* strict;
-  raise it (closer to 1.0) to let quieter speech through. The current
-  value is `0.8`.
+- **It didn't hear you at all.** Lower `confidence` (currently `0.7`) or
+  `min_volume` (currently `0.5`) in the `VADParams` inside `bot.py` to let
+  quieter or less-confident audio segments through.
 
 ---
 
@@ -225,23 +237,142 @@ actually heard you say and what it actually replied. From there:
 
 - **OpenAI** (gpt-4o-mini): about a tenth of a cent per minute of conversation.
 - **Twilio** (US local number, inbound): $1.15 per month plus $0.0085 per minute.
-- **Speech-to-text** (Whisper, local): free. Uses your GPU.
+- **Speech-to-text** (Deepgram nova-3): $0.0043 per minute of caller audio.
 - **Text-to-speech** (Piper, local): free. Uses your CPU.
-- **ngrok** (development): free tier is fine. Stable URLs cost $8/month.
+- **ngrok** (development only): free tier is fine. Stable URLs cost $8/month.
+- **Fly.io** (production hosting): ~$5–10/month for one always-on `shared-cpu-1x`
+  machine with a 1 GB volume. Free for most side-project traffic within the
+  Hobby plan.
 
-A 5-minute call costs you roughly five cents.
+A 5-minute call costs you roughly seven cents (LLM + STT + Twilio + a
+negligible slice of Fly.io).
+
+---
+
+## Deploying to production (Fly.io)
+
+Merges to `main` deploy automatically. This section is the one-time setup
+you do before the first deploy works.
+
+### 1. Install the Fly CLI
+
+Once, on your dev machine:
+
+```
+# Windows (PowerShell)
+iwr https://fly.io/install.ps1 -useb | iex
+
+# macOS / Linux
+curl -L https://fly.io/install.sh | sh
+```
+
+Then `fly auth login` and pick (or create) the org you want to bill.
+
+### 2. Create the app and its persistent volume
+
+From the project root, one time:
+
+```
+fly launch --no-deploy --copy-config --name funkle-receptionist
+fly volumes create receptionist_data --region iad --size 1
+```
+
+`fly.toml` already has the volume mount, region, and machine size wired up
+— `fly launch` just picks a name and creates the app record on Fly's side.
+Change `funkle-receptionist` to whatever name is free; if you change it,
+update the `app = "..."` line in `fly.toml` to match.
+
+### 3. Set production secrets
+
+Fly-managed secrets, injected as env vars at runtime — never committed:
+
+```
+fly secrets set \
+  OPENAI_API_KEY=sk-... \
+  DEEPGRAM_API_KEY=... \
+  TWILIO_ACCOUNT_SID=AC... \
+  TWILIO_AUTH_TOKEN=...
+```
+
+Any of the optional overrides (`OPENAI_MODEL`, `DEEPGRAM_MODEL`,
+`PIPER_VOICE`, `LOG_LEVEL`) can be set the same way.
+
+### 4. First manual deploy
+
+Prove the container image builds and boots before hooking up CI:
+
+```
+fly deploy --remote-only
+```
+
+When it prints `Machine ... reached its target running state`, browse to
+`https://funkle-receptionist.fly.dev/admin` and confirm the admin UI loads.
+
+### 5. Point Twilio at the Fly URL
+
+In the Twilio Console, edit your number's "A call comes in" webhook to
+`https://<your-app>.fly.dev/voice` (POST). Dial it — you should hear the bot.
+No more ngrok in production.
+
+### 6. Turn on CI/CD
+
+Deploy-on-merge lives at `.github/workflows/deploy.yml`. It runs
+`flyctl deploy --remote-only` whenever `main` receives a push, using a
+long-lived Fly API token stored as a GitHub Actions secret.
+
+```
+# Generate a deploy-only token bound to this app
+fly tokens create deploy -a funkle-receptionist
+```
+
+Copy the token (starts with `FlyV1 fm2_...`). Then in GitHub:
+
+1. Go to **Settings → Secrets and variables → Actions**.
+2. Click **New repository secret**.
+3. Name: `FLY_API_TOKEN`. Value: the token you just copied.
+
+From now on: open a PR from any feature branch, get it reviewed, merge to
+`main`, watch **Actions** show a green deploy, refresh the app URL. That's it.
+
+### Day-to-day operations
+
+| Task | Command |
+|---|---|
+| Tail production logs | `fly logs -a funkle-receptionist` |
+| Open a shell in the running container | `fly ssh console -a funkle-receptionist` |
+| Roll back to the previous release | `fly releases -a funkle-receptionist` then `fly deploy --image <previous-image-ref>` |
+| Download the live salon workbook | `fly ssh sftp get /data/ReceptionistData.xlsx` |
+| See what secrets are set (names only) | `fly secrets list -a funkle-receptionist` |
+| Scale up to a bigger VM | `fly scale vm shared-cpu-2x --memory 2048` |
+
+### What lives where after deploy
+
+- **Code**: baked into the container image at `/app`.
+- **Salon data**: `/data/ReceptionistData.xlsx` on the `receptionist_data`
+  volume. Persists across `fly deploy`s. Edits made in the admin UI stick.
+- **Logs**: `/app/logs/*.log` inside the container (rotated), plus everything
+  streams to Fly's log service (queryable via `fly logs`). If you want the
+  transcript log to survive redeploys, move `LOG_DIR` to `/data/logs/` in
+  `server.py`.
 
 ---
 
 ## The big-picture trade-offs we made
 
-- **We run our own speech-to-text and text-to-speech** so the bot has no
-  per-call cost beyond the AI itself. Trade-off: Whisper is OK but not
-  great on phone audio; a paid service like Deepgram is meaningfully
-  more accurate.
+- **We use Deepgram for speech-to-text** so the app has no GPU requirement
+  and can run on a $5/month Fly.io machine. Trade-off: ~$0.26/hour of call
+  vs. free local Whisper — but no GPU, no Windows-only CUDA setup, and
+  Deepgram is meaningfully more accurate on phone audio anyway.
+- **We use Piper for text-to-speech** so there's no per-word TTS charge.
+  Trade-off: less natural-sounding than ElevenLabs, but "free forever" on
+  the CPU we already pay for.
 - **We use Twilio as the phone-network bridge** instead of running our own
   SIP infrastructure. Trade-off: a few cents per minute, but no telecom
   expertise required.
 - **The transport is swappable.** Browser, Twilio, and other phone providers
   all plug into the same pipeline. If we ever leave Twilio for a cheaper
   provider, it's a one-file change.
+- **Data lives in Excel on a persistent volume.** Trade-off: won't scale
+  past one salon and one machine, but it *is* the file managers know how
+  to open, edit, and back up. Migrating to Postgres is a straight
+  `salon.py` refactor whenever we outgrow this.

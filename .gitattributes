@@ -1,0 +1,6 @@
+# Force LF line endings on files that get executed inside a Linux container.
+# Otherwise Windows checkout would land them with CRLF and Docker would fail
+# with "bad interpreter: /usr/bin/env sh^M".
+*.sh          text eol=lf
+Dockerfile    text eol=lf
+entrypoint.sh text eol=lf

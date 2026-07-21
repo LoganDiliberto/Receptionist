@@ -1,0 +1,39 @@
+# Keep the build context small. Anything referenced from the Dockerfile
+# still gets copied in explicitly with COPY.
+
+.venv/
+.env
+.git/
+.github/
+.gitignore
+.install.log
+.pytest_cache/
+.cache/
+__pycache__/
+**/__pycache__/
+*.pyc
+logs/
+
+# Dev-only helpers we never want inside the image.
+run.py
+run.cmd
+ngrok.exe
+_inspect.py
+_read_xlsx.py
+_smoke.py
+
+# Angular build artifacts — rebuilt fresh inside the image.
+admin-ui/node_modules/
+admin-ui/dist/
+admin-ui/.angular/
+admin-ui/out-tsc/
+
+# Voice files: pre-downloaded inside the image, not shipped from disk.
+voices/*.onnx
+voices/*.onnx.json
+
+# OS / editor cruft.
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

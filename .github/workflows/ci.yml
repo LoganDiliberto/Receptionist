@@ -1,0 +1,55 @@
+name: CI
+
+# Cheap sanity checks on every push and PR: does Python still parse, and
+# does the Angular admin UI still build?  Keeps this workflow completely
+# independent of deploy.yml so a red PR blocks a merge without also
+# blocking prod pushes.
+
+on:
+  push:
+    branches-ignore:
+      - main
+  pull_request:
+
+jobs:
+  python-checks:
+    name: Python syntax + import check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile all Python files
+        run: python -m compileall -q .
+
+      # `python -c "import server"` would try to load .env and connect to
+      # things at import time; we just verify each module parses cleanly.
+      # A full smoke test happens on Fly.io via the container's healthcheck.
+
+  admin-ui-build:
+    name: Angular admin UI build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: admin-ui/package-lock.json
+
+      - name: Install and build
+        working-directory: admin-ui
+        run: |
+          npm ci
+          npm run build

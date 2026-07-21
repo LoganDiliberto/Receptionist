@@ -1,0 +1,51 @@
+# Fly.io config for the Funkle receptionist.
+#
+# Assumptions:
+# - App name below is a placeholder. Change it, or let `fly launch` pick a
+#   unique one on first deploy.
+# - Region: pick one close to the salon's callers. iad = Ashburn VA (US-East).
+# - A persistent volume named `receptionist_data` is mounted at /data and
+#   holds the salon xlsx workbook (surviving redeploys).
+# - This app must NEVER auto-stop mid-call — Twilio holds a WebSocket open
+#   for the whole call, and stopping the machine would drop it.
+
+app = "funkle-receptionist"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  HOST = "0.0.0.0"
+  PORT = "8080"
+  SALON_DATA_PATH = "/data/ReceptionistData.xlsx"
+
+# Persistent, per-machine volume for the Excel workbook (and anything else
+# we want to survive `fly deploy`, like the transcripts log). Create it once:
+#   fly volumes create receptionist_data --region iad --size 1
+[mounts]
+  source = "receptionist_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # A voice bot must never sleep — even one dropped call is a bad experience.
+  # If cost matters later, set min_machines_running = 0 and accept the ~10s
+  # cold-start on the first call after idle.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    # A single machine happily handles ~20 concurrent calls (LLM/Deepgram
+    # are the bottlenecks, both remote). Raise this if you scale up VM size.
+    soft_limit = 20
+    hard_limit = 40
+
+# A tiny VM is fine to start — Deepgram STT and OpenAI LLM are the
+# compute-heavy parts and both run in the cloud, not on this box.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"

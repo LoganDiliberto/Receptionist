@@ -1,0 +1,38 @@
+name: Deploy to Fly.io
+
+# Merge to main -> production deploy.
+# The workflow builds the Docker image on Fly's remote builder (so we don't
+# need Docker on the runner) and rolls the new image out with zero-downtime
+# blue/green semantics via `flyctl deploy`.
+
+on:
+  push:
+    branches:
+      - main
+  # Also run when manually triggered from the Actions tab.
+  workflow_dispatch:
+
+# Cancel any in-flight deploy if a newer commit lands — we only care about
+# the latest main.
+concurrency:
+  group: fly-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Build & deploy
+    runs-on: ubuntu-latest
+    # Guardrail: only real merges to main deploy. If you fork the repo,
+    # deploys stay off until you set FLY_API_TOKEN in the fork's secrets.
+    if: github.repository == 'LoganDiliberto/Receptionist'
+    steps:
+      - name: Check out the merged commit
+        uses: actions/checkout@v4
+
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy to Fly.io
+        run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

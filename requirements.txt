@@ -1,0 +1,15 @@
+# Runtime dependencies for the Funkle receptionist server.
+#
+# Deliberately does NOT include faster-whisper / ctranslate2 / nvidia-*.
+# Production runs Deepgram STT (cloud) — the GPU-Whisper path is dev-only.
+
+fastapi==0.136.3
+uvicorn[standard]==0.49.0
+python-dotenv==1.2.2
+loguru==0.7.3
+openpyxl==3.1.5
+
+# Pipecat + the exact set of provider extras we use in bot.py.
+# `silero` gives us onnxruntime-based VAD (CPU-only, no CUDA).
+# `webrtc` powers the /offer browser test client; drop it if you only run Twilio.
+pipecat-ai[deepgram,piper,silero,openai,webrtc]==1.3.0
