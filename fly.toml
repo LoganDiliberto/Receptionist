@@ -9,7 +9,7 @@
 # - This app must NEVER auto-stop mid-call — Twilio holds a WebSocket open
 #   for the whole call, and stopping the machine would drop it.
 
-app = "funkle-receptionist"
+app = "salon-poc"
 primary_region = "iad"
 
 [build]
