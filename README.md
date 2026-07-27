@@ -62,9 +62,9 @@ can stop talking and listen.
    "Connect the live audio of this call to my WebSocket at `/twilio/ws`."
 4. Twilio opens that WebSocket. From now on, every ~20 milliseconds of caller
    audio is sent over the WebSocket as a small chunk of bytes.
-5. The program runs each chunk through the pipeline above. When the caller
-   pauses long enough, Whisper transcribes what they said and hands the text
-   to the AI.
+5. The program runs each chunk through the pipeline above. Deepgram
+   streams transcriptions back in real time; when the VAD says the caller
+   has stopped talking, the finalized text is handed to the AI.
 6. The AI's reply is streamed token-by-token into Piper, which produces audio
    bytes that are sent back over the same WebSocket.
 7. Twilio plays those bytes to the caller, who hears the receptionist speak.
@@ -87,7 +87,7 @@ instead of a phone, so you can test changes without making a phone call.
 | `admin_api.py` | FastAPI router mounted at `/api` that exposes staff/services/hours/appointments/calls to the admin UI. |
 | `admin-ui/` | Angular admin console (built with `npm run build`; served by FastAPI at `/admin`). |
 | `static/index.html` | A small webpage that lets you "call" the bot from your browser for testing. |
-| `voices/` | The Piper text-to-speech voice files. |
+| `voices/` | The Piper text-to-speech voice files. Not committed (see `.gitignore`) — Piper auto-downloads the voice named by `PIPER_VOICE` on first synthesis, and the Docker build pre-bakes it so the first call has no download latency. |
 | `logs/server.log` | Everything the program logs, rotated. Useful when something breaks. |
 | `logs/transcripts.log` | Just the conversation transcripts. One line per turn. Useful for tuning. |
 | `.env` | Secrets and settings: your OpenAI API key, Deepgram API key, Twilio credentials, model choices. Not committed to git. |
@@ -130,7 +130,12 @@ instead of a phone, so you can test changes without making a phone call.
 2. Open http://127.0.0.1:7860 in your browser.
 3. Click **Start call**, allow microphone access, and talk.
 
-### Real phone call
+### Real phone call (development only)
+
+In production the Twilio webhook points at the stable Fly.io URL — see
+[Deploying to production](#deploying-to-production-flyio). This section
+is for when you want to test a phone call against **local** code changes
+before shipping them, without pushing a full deploy.
 
 The easy way — one command starts both the server and ngrok, prints the
 public URL you need for Twilio, and shuts everything down on Ctrl+C:
@@ -141,9 +146,11 @@ run
 
 (or `.venv\Scripts\python.exe run.py` if you'd rather not use the `.cmd`
 shortcut.) Copy the printed `Twilio webhook` URL into your Twilio number's
-"A call comes in" webhook (POST) in the Twilio Console, then dial the
-number. See `run.py` — it wraps `server.py` and `ngrok http 7860` so you
-don't have to babysit two terminals.
+"A call comes in" webhook (POST) in the Twilio Console, dial the number,
+then **switch the webhook back to the Fly URL** when you're done so
+production traffic isn't going to your laptop. See `run.py` — it wraps
+`server.py` and `ngrok http 7860` so you don't have to babysit two
+terminals.
 
 If you'd rather run them yourself:
 
@@ -153,6 +160,7 @@ If you'd rather run them yourself:
 4. In the Twilio Console, open your number's settings. For "A call comes in",
    set the webhook to `https://<your-ngrok-url>/voice` (POST).
 5. Dial your Twilio number from any phone.
+6. When you're done, put the Fly URL back in the Twilio webhook.
 
 ---
 
@@ -216,20 +224,24 @@ in `server.py`.
 
 ## How to tune it when it goes wrong
 
-Watch `logs/transcripts.log` after a bad call. You'll see what the program
-actually heard you say and what it actually replied. From there:
+Watch `logs/transcripts.log` locally, or `fly logs -a salon-poc` in
+production. You'll see what the program actually heard you say and what
+it actually replied. In production, the **Calls** page in the admin UI
+also gives you a per-call transcript view. From there:
 
 - **It heard the wrong words.** Try a phone-tuned Deepgram model —
   `DEEPGRAM_MODEL=nova-2-phonecall` is trained specifically on
-  narrow-band phone audio. If a specific accent trips it up, boost
-  key vocabulary via the `keywords` setting on `DeepgramSTTService`.
-- **It heard you correctly but said something dumb.** Use a smarter language
-  model (`OPENAI_MODEL=gpt-4o` in `.env`).
-- **It cut you off mid-sentence.** Increase `stop_secs` in `bot.py` (the VAD
-  setting). Higher means more pause tolerance, lower means snappier replies.
+  narrow-band phone audio. Set it in `fly.toml [env]` (not as a secret)
+  and redeploy. If a specific accent trips it up, boost key vocabulary
+  via the `keywords` setting on `DeepgramSTTService`.
+- **It heard you correctly but said something dumb.** Use a smarter
+  language model (`OPENAI_MODEL=gpt-4o` in `fly.toml [env]`).
+- **It cut you off mid-sentence.** Increase `stop_secs` in `bot.py` (the
+  VAD setting). Higher means more pause tolerance, lower means snappier
+  replies.
 - **It didn't hear you at all.** Lower `confidence` (currently `0.7`) or
-  `min_volume` (currently `0.5`) in the `VADParams` inside `bot.py` to let
-  quieter or less-confident audio segments through.
+  `min_volume` (currently `0.5`) in the `VADParams` inside `bot.py` to
+  let quieter or less-confident audio segments through.
 
 ---
 
@@ -251,40 +263,58 @@ negligible slice of Fly.io).
 
 ## Deploying to production (Fly.io)
 
-Merges to `main` deploy automatically. This section is the one-time setup
-you do before the first deploy works.
+The live app is at **https://salon-poc.fly.dev** — one always-on
+`shared-cpu-1x` machine in `iad`, backed by a 1 GB persistent volume for
+the salon workbook. Merges to `main` deploy automatically via the
+`.github/workflows/deploy.yml` workflow. The rest of this section
+documents the one-time setup and the day-to-day operations.
+
+> If you're forking this repo for a different salon, pick a new app
+> name (`salon-poc` is already taken by us) and update the `app = "..."`
+> line in `fly.toml` to match. Everywhere `salon-poc` appears below,
+> substitute your own name.
 
 ### 1. Install the Fly CLI
 
 Once, on your dev machine:
 
-```
-# Windows (PowerShell)
+```powershell
+# Windows — run in PowerShell, NOT cmd.exe (iwr is a PowerShell alias).
 iwr https://fly.io/install.ps1 -useb | iex
+
+# Windows alternative — winget works from either shell:
+winget install Fly.Flyctl
 
 # macOS / Linux
 curl -L https://fly.io/install.sh | sh
 ```
 
-Then `fly auth login` and pick (or create) the org you want to bill.
+Close and reopen your terminal after install so `PATH` picks up
+`fly.exe`. Then `fly auth login` and pick (or create) the org you want
+to bill.
 
-### 2. Create the app and its persistent volume
+### 2. Create the app AND its persistent volume
 
-From the project root, one time:
+Both commands must run before the first deploy — a machine that mounts
+`/data` can't start if there's no volume for it to attach to. Fly will
+error out with `New machine ... needs an unattached volume named
+'receptionist_data'` if you skip the second command.
 
 ```
-fly launch --no-deploy --copy-config --name funkle-receptionist
+fly launch --no-deploy --copy-config --name salon-poc
 fly volumes create receptionist_data --region iad --size 1
 ```
 
-`fly.toml` already has the volume mount, region, and machine size wired up
-— `fly launch` just picks a name and creates the app record on Fly's side.
-Change `funkle-receptionist` to whatever name is free; if you change it,
-update the `app = "..."` line in `fly.toml` to match.
+`fly launch --no-deploy` just registers the app on Fly's side (it
+notices the existing `fly.toml` and reuses it); `fly volumes create`
+provisions the 1 GB volume that gets mounted at `/data` per `fly.toml`.
 
 ### 3. Set production secrets
 
-Fly-managed secrets, injected as env vars at runtime — never committed:
+Fly-managed **secrets** are for API keys and passwords only — never
+non-sensitive config. Everything else goes in the `[env]` block of
+`fly.toml` where it's version-controlled and visible in diffs (see
+[Fly config vs. Fly secrets](#fly-config-vs-fly-secrets) below).
 
 ```
 fly secrets set \
@@ -294,25 +324,25 @@ fly secrets set \
   TWILIO_AUTH_TOKEN=...
 ```
 
-Any of the optional overrides (`OPENAI_MODEL`, `DEEPGRAM_MODEL`,
-`PIPER_VOICE`, `LOG_LEVEL`) can be set the same way.
-
 ### 4. First manual deploy
 
 Prove the container image builds and boots before hooking up CI:
 
 ```
-fly deploy --remote-only
+fly deploy
 ```
 
 When it prints `Machine ... reached its target running state`, browse to
-`https://funkle-receptionist.fly.dev/admin` and confirm the admin UI loads.
+`https://salon-poc.fly.dev/admin` and confirm the admin UI loads. If it
+hangs, the most common cause is a mismatch between the port the app
+listens on and `internal_port` in `fly.toml` — see the debugging
+section below.
 
 ### 5. Point Twilio at the Fly URL
 
 In the Twilio Console, edit your number's "A call comes in" webhook to
-`https://<your-app>.fly.dev/voice` (POST). Dial it — you should hear the bot.
-No more ngrok in production.
+`https://salon-poc.fly.dev/voice` (POST). Dial it — you should hear the
+bot. No more ngrok in production.
 
 ### 6. Turn on CI/CD
 
@@ -321,8 +351,8 @@ Deploy-on-merge lives at `.github/workflows/deploy.yml`. It runs
 long-lived Fly API token stored as a GitHub Actions secret.
 
 ```
-# Generate a deploy-only token bound to this app
-fly tokens create deploy -a funkle-receptionist
+# Generate a deploy-only token bound to this app (1 year expiry)
+fly tokens create deploy -a salon-poc --expiry 8760h
 ```
 
 Copy the token (starts with `FlyV1 fm2_...`). Then in GitHub:
@@ -331,25 +361,81 @@ Copy the token (starts with `FlyV1 fm2_...`). Then in GitHub:
 2. Click **New repository secret**.
 3. Name: `FLY_API_TOKEN`. Value: the token you just copied.
 
-From now on: open a PR from any feature branch, get it reviewed, merge to
-`main`, watch **Actions** show a green deploy, refresh the app URL. That's it.
+From now on: open a PR from any feature branch, get it reviewed, merge
+to `main`, watch **Actions** show a green deploy, refresh the app URL.
+That's it.
+
+### Fly config vs. Fly secrets
+
+Fly has two ways to inject environment variables into your container:
+the `[env]` block in `fly.toml` and `fly secrets`. **Secrets override
+`[env]` values.** Use them correctly or you'll get very confusing
+behavior:
+
+| Kind | Where it goes | What belongs there |
+|---|---|---|
+| Public config | `[env]` in `fly.toml` | `HOST`, `PORT`, `SALON_DATA_PATH`, `OPENAI_MODEL`, `DEEPGRAM_MODEL`, `PIPER_VOICE`, `LOG_LEVEL` — anything you'd be happy to see in a git diff. |
+| Actual secrets | `fly secrets set ...` | `OPENAI_API_KEY`, `DEEPGRAM_API_KEY`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` — anything that grants access if leaked. |
+
+We hit this the hard way once: `PORT` got set as a secret with an old
+value, which overrode the `PORT=8080` in `fly.toml`. The app listened
+on the old port, Fly's edge proxied to the new one, HTTP hung forever.
+If you ever see that shape of failure, check `fly secrets list` first —
+if you spot a name that also appears in `fly.toml [env]`, unset it:
+
+```
+fly secrets unset PORT HOST DEEPGRAM_MODEL OPENAI_MODEL
+```
+
+### Debugging a call in production
+
+Something went wrong on a phone call. In order, check:
+
+1. **Did Twilio even reach us?**
+   Twilio Console → **Monitor → Logs → Calls** shows every inbound
+   call and its status. If it's not there, your phone never got to
+   Twilio (dialed wrong number, no carrier signal, or the number
+   isn't provisioned). If it's there with an error, click for the
+   webhook error. If Twilio thinks it succeeded but you saw no bot,
+   the webhook URL is probably pointing somewhere stale (e.g. old
+   ngrok URL from dev testing).
+2. **Did our server get the request?**
+   `fly logs` should show `POST /voice` followed by a WebSocket
+   accept on `/twilio/ws`. If `/voice` fires but the WS never
+   accepts, the TwiML response is pointing at the wrong host. If
+   neither shows up, Twilio's webhook still points somewhere else.
+3. **Did the bot pipeline start and run?**
+   Look for `DeepgramSTTService#0 TTFB: ...s` and
+   `OpenAILLMService#0 TTFB: ...s` lines. Their absence means the
+   pipeline crashed at startup — usually a missing or wrong API
+   key. `Disconnecting from Deepgram` at the end of a session is
+   the normal shutdown.
+4. **Deepgram dashboard shows zero usage?**
+   Almost always the wrong-project trap: Deepgram accounts have
+   multiple projects, and usage rolls up per-project. Confirm the
+   key you set as `DEEPGRAM_API_KEY` is listed under the project
+   you're viewing in the console (**Settings → API Keys**). Also
+   remember the dashboard has a 5–15 minute reporting lag.
 
 ### Day-to-day operations
 
 | Task | Command |
 |---|---|
-| Tail production logs | `fly logs -a funkle-receptionist` |
-| Open a shell in the running container | `fly ssh console -a funkle-receptionist` |
-| Roll back to the previous release | `fly releases -a funkle-receptionist` then `fly deploy --image <previous-image-ref>` |
+| Tail production logs | `fly logs -a salon-poc` |
+| Open a shell in the running container | `fly ssh console -a salon-poc` |
+| Roll back to the previous release | `fly releases -a salon-poc` then `fly deploy --image <previous-image-ref>` |
 | Download the live salon workbook | `fly ssh sftp get /data/ReceptionistData.xlsx` |
-| See what secrets are set (names only) | `fly secrets list -a funkle-receptionist` |
+| See what secrets are set (names only) | `fly secrets list -a salon-poc` |
 | Scale up to a bigger VM | `fly scale vm shared-cpu-2x --memory 2048` |
+| Restart the machine (no rebuild) | `fly apps restart salon-poc` |
 
 ### What lives where after deploy
 
 - **Code**: baked into the container image at `/app`.
 - **Salon data**: `/data/ReceptionistData.xlsx` on the `receptionist_data`
   volume. Persists across `fly deploy`s. Edits made in the admin UI stick.
+- **Piper voice**: `/app/voices/en_US-amy-medium.onnx` — pre-baked into
+  the image at build time by the Dockerfile.
 - **Logs**: `/app/logs/*.log` inside the container (rotated), plus everything
   streams to Fly's log service (queryable via `fly logs`). If you want the
   transcript log to survive redeploys, move `LOG_DIR` to `/data/logs/` in
