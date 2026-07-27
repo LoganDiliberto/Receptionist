@@ -1,10 +1,13 @@
 """Salon data store: hours, staff, services, schedules, and appointments.
 
-Backed by an Excel workbook. On startup, ensures every sheet the app expects
-exists (creating a default `Services` sheet from historical constants if the
-workbook doesn't have one yet). Static info is cached in `INFO`; mutations go
-through the CRUD helpers below, which persist to the workbook and refresh the
-cache so the next voice-bot call sees the new state.
+Backed by SQLite via SQLAlchemy. Static info (staff list, services,
+schedules, hours, location) is cached in ``INFO`` on startup and
+refreshed via ``reload()`` after any admin mutation; the voice bot reads
+from that cache to avoid a DB round-trip on every LLM tool call.
+
+Mutations always go through the public helpers below, which use a
+transaction and then call ``reload()`` — the next call sees the new
+state.
 
 Public surface used by the voice bot (`bot.py`):
   - INFO                       (cached SalonInfo)
@@ -13,7 +16,7 @@ Public surface used by the voice bot (`bot.py`):
   - check_availability(...)    (LLM tool)
   - book_appointment(...)      (LLM tool)
 
-Public surface used by the admin API (`server.py`):
+Public surface used by the admin API (`admin_api.py`):
   - list/create/update/delete for staff, services, appointments
   - get/update for hours and location
   - reload() to refresh in-memory state after a mutation
@@ -22,41 +25,39 @@ Public surface used by the admin API (`server.py`):
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
-from pathlib import Path
 from threading import RLock
 from typing import Iterable
 
-import openpyxl
 from loguru import logger
+from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, selectinload
 
-DEFAULT_XLSX = Path(__file__).parent / "ReceptionistData.xlsx"
-SALON_XLSX = Path(os.getenv("SALON_DATA_PATH", str(DEFAULT_XLSX)))
+from db import session_scope
+from models import (
+    Appointment,
+    Hours as HoursRow,
+    Salon as SalonRow,
+    Service as ServiceRow,
+    Staff as StaffRow,
+    StaffHours as StaffHoursRow,
+)
 
 # The canonical order we render weekdays in everywhere (schedules, hours, UI).
 WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday",
             "Thursday", "Friday", "Saturday"]
 
-# Fallback used the very first time we boot against an older workbook that
-# doesn't yet have a Services sheet. Real prices are trivially editable in
-# the admin UI once the sheet exists.
-_DEFAULT_SERVICES: list[tuple[str, int, float]] = [
-    ("Cut", 30, 35.0),
-    ("Color", 90, 95.0),
-    ("Perm", 120, 120.0),
-    ("Shave", 30, 25.0),
-]
-
 SLOT_MIN = 30  # all appointments align to 30-minute slot boundaries
 
-# Excel writes aren't atomic — serialize all workbook ops behind a single lock
-# so concurrent admin edits and bot bookings don't stomp each other. We use a
-# reentrant threading lock (not asyncio) because helpers call each other and
-# are dispatched to `asyncio.to_thread`.
+# Reentrant lock guarding the cached ``INFO`` and serializing writes.
+# SQLite itself serializes writes at the file level, but the salon-side
+# logic (validate -> check conflicts -> insert) needs to be atomic
+# across those steps too. A single async lock ensures the two bot tools
+# don't race with each other or with admin edits.
 _lock = RLock()
 _async_lock = asyncio.Lock()
 
@@ -79,12 +80,6 @@ def _parse_time(s: str) -> time:
     return time(hour, minute)
 
 
-def _parse_range(s: str) -> tuple[time, time]:
-    """Parse '10AM to 4PM' -> (time(10,0), time(16,0))."""
-    parts = re.split(r"\s+to\s+", s.strip(), flags=re.IGNORECASE)
-    return _parse_time(parts[0]), _parse_time(parts[1])
-
-
 def _parse_date(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
@@ -105,7 +100,11 @@ def _weekday_name(d: date) -> str:
 
 
 def _fmt_range(start: time, end: time) -> str:
-    """Render a schedule range in the '10AM to 4PM' style the sheet uses."""
+    """Render a schedule range in the '10AM to 4PM' style the sheet uses.
+
+    Kept for backwards compat with import/export CLIs and the existing
+    ``system_prompt_context`` renderer.
+    """
 
     def one(t: time) -> str:
         suffix = "AM" if t.hour < 12 else "PM"
@@ -115,7 +114,7 @@ def _fmt_range(start: time, end: time) -> str:
     return f"{one(start)} to {one(end)}"
 
 
-# ---------- Data model ----------
+# ---------- Data model (cached in-memory) ----------
 
 
 @dataclass(frozen=True)
@@ -140,137 +139,70 @@ class SalonInfo:
     services: dict[str, Service] = field(default_factory=dict)
 
 
-# ---------- Workbook bootstrap ----------
-
-
-_APPT_COLUMNS = [
-    "id", "created_at", "customer_name", "customer_phone",
-    "stylist", "service", "date", "start_time", "end_time",
-    "session_id",
-]
-
-
-def _ensure_workbook_shape() -> None:
-    """Make sure every sheet we depend on exists, seeding sane defaults.
-
-    Also migrates the Appointments sheet in-place when we've added new columns
-    (like `session_id`) so older workbooks keep working after an upgrade.
-    """
-    with _lock:
-        wb = openpyxl.load_workbook(SALON_XLSX)
-        dirty = False
-
-        if "Appointments" not in wb.sheetnames:
-            ws = wb.create_sheet("Appointments")
-            ws.append(_APPT_COLUMNS)
-            dirty = True
-        else:
-            ws = wb["Appointments"]
-            header = [cell.value for cell in ws[1]] if ws.max_row >= 1 else []
-            missing = [c for c in _APPT_COLUMNS if c not in header]
-            if missing:
-                # openpyxl's `Cell` doesn't let us insert columns portably, so
-                # we just append the new header names on the end and let the
-                # matching rows stay blank until they're written.
-                for i, col in enumerate(missing):
-                    ws.cell(row=1, column=len(header) + 1 + i, value=col)
-                dirty = True
-
-        if "Services" not in wb.sheetnames:
-            ws = wb.create_sheet("Services")
-            ws.append(["name", "duration_minutes", "price"])
-            for name, dur, price in _DEFAULT_SERVICES:
-                ws.append([name, dur, price])
-            dirty = True
-
-        if dirty:
-            wb.save(SALON_XLSX)
-
-
-# ---------- Read-side: load a fresh SalonInfo ----------
+# ---------- Read-side: load a fresh SalonInfo from the DB ----------
 
 
 def _load_info() -> SalonInfo:
-    wb = openpyxl.load_workbook(SALON_XLSX, data_only=True)
+    with session_scope() as sess:
+        # Location — single-row table. Missing row is fine on a freshly
+        # migrated DB; caller can populate via update_location.
+        salon_row = sess.scalar(select(SalonRow).order_by(SalonRow.id).limit(1))
+        location = salon_row.location if salon_row else ""
 
-    # Hours sheet
-    hours: dict[str, tuple[time, time] | None] = {}
-    for day, open_s, close_s in list(wb["Hours"].iter_rows(values_only=True))[1:]:
-        if not day:
-            continue
-        if (open_s or "").strip().upper() == "NA":
-            hours[day] = None
-        else:
-            hours[day] = (_parse_time(str(open_s)), _parse_time(str(close_s)))
+        # Hours — one row per weekday. Fill in any missing weekdays as
+        # "unknown, treat as closed" so callers can rely on all seven
+        # keys being present.
+        hours: dict[str, tuple[time, time] | None] = {d: None for d in WEEKDAYS}
+        for h in sess.scalars(select(HoursRow)):
+            if h.open is None or h.close is None:
+                hours[h.weekday] = None
+            else:
+                hours[h.weekday] = (h.open, h.close)
 
-    # Location sheet
-    loc_rows = list(wb["Location"].iter_rows(values_only=True))
-    location = str(loc_rows[1][1]) if len(loc_rows) > 1 and loc_rows[1][1] else ""
+        # Services
+        services: dict[str, Service] = {}
+        for row in sess.scalars(select(ServiceRow).order_by(ServiceRow.name)):
+            services[row.name.lower()] = Service(
+                name=row.name,
+                duration_minutes=row.duration_minutes,
+                price=row.price,
+            )
 
-    # Services sheet
-    services: dict[str, Service] = {}
-    for row in list(wb["Services"].iter_rows(values_only=True))[1:]:
-        if not row or not row[0]:
-            continue
-        name = str(row[0]).strip()
-        try:
-            duration = int(row[1]) if row[1] is not None else 30
-        except (TypeError, ValueError):
-            duration = 30
-        try:
-            price = float(row[2]) if row[2] is not None else 0.0
-        except (TypeError, ValueError):
-            price = 0.0
-        services[name.lower()] = Service(name=name, duration_minutes=duration, price=price)
-
-    # Associates sheet: staff -> services they offer
-    stylist_services: dict[str, tuple[str, ...]] = {}
-    for row in list(wb["Associates"].iter_rows(values_only=True))[1:]:
-        name = row[0]
-        if not name:
-            continue
-        offered = tuple(
-            s.strip().lower()
-            for s in row[1:]
-            if s and isinstance(s, str) and s.strip()
+        # Staff, with their offered services and weekly schedule.
+        stylists: dict[str, Stylist] = {}
+        stmt = (
+            select(StaffRow)
+            .options(selectinload(StaffRow.services), selectinload(StaffRow.hours))
+            .order_by(StaffRow.name)
         )
-        stylist_services[str(name).strip()] = offered
+        for s in sess.scalars(stmt):
+            schedule = {
+                sh.weekday: (sh.start, sh.end) for sh in s.hours
+            }
+            offered = tuple(sorted(svc.name.lower() for svc in s.services))
+            stylists[s.name] = Stylist(
+                name=s.name, services=offered, schedule=schedule
+            )
 
-    # Schedule sheet: staff -> weekday -> (start, end)
-    sched_rows = list(wb["Schedule"].iter_rows(values_only=True))
-    day_headers = [d for d in sched_rows[0][1:] if d]
-    schedules: dict[str, dict[str, tuple[time, time]]] = {}
-    for row in sched_rows[1:]:
-        name = row[0]
-        if not name:
-            continue
-        sched: dict[str, tuple[time, time]] = {}
-        for day, cell in zip(day_headers, row[1:]):
-            if cell and isinstance(cell, str) and cell.strip():
-                sched[day] = _parse_range(cell)
-        schedules[str(name).strip()] = sched
-
-    stylists = {
-        name: Stylist(name=name, services=offered, schedule=schedules.get(name, {}))
-        for name, offered in stylist_services.items()
-    }
-    return SalonInfo(location=location, hours=hours, stylists=stylists, services=services)
+    return SalonInfo(
+        location=location, hours=hours, stylists=stylists, services=services
+    )
 
 
-_ensure_workbook_shape()
+# Module-level cache. Populated on import; refreshed via ``reload()``.
 INFO: SalonInfo = _load_info()
 SERVICE_DURATIONS_MIN: dict[str, int] = {
     key: svc.duration_minutes for key, svc in INFO.services.items()
 }
 logger.info(
-    f"Salon loaded from {SALON_XLSX.name}: "
+    f"Salon loaded from DB: "
     f"{len(INFO.stylists)} staff ({', '.join(INFO.stylists) or 'none'}), "
     f"{len(INFO.services)} services"
 )
 
 
 def reload() -> None:
-    """Refresh cached state after a workbook mutation. Cheap; loads ~5 sheets."""
+    """Refresh cached state after a DB mutation. Cheap; hits ~5 tables."""
     global INFO, SERVICE_DURATIONS_MIN
     with _lock:
         INFO = _load_info()
@@ -279,62 +211,23 @@ def reload() -> None:
         }
 
 
-# ---------- Appointments sheet R/W ----------
+# ---------- Read-side helpers (DB row -> wire dict) ----------
 
 
-def _read_appointments() -> list[dict]:
-    with _lock:
-        wb = openpyxl.load_workbook(SALON_XLSX, data_only=True)
-        ws = wb["Appointments"]
-        rows = list(ws.iter_rows(values_only=True))
-    if len(rows) < 2:
-        return []
-    out = []
-    for row in rows[1:]:
-        if not row or not row[0]:
-            continue
-        rec = dict(zip(_APPT_COLUMNS, row))
-        # Normalise: dates/times may come back as datetime objects if Excel
-        # auto-typed the cell. We always want ISO strings on the wire.
-        if isinstance(rec.get("date"), (datetime, date)):
-            rec["date"] = rec["date"].strftime("%Y-%m-%d") if not isinstance(rec["date"], datetime) else rec["date"].date().isoformat()
-        else:
-            rec["date"] = str(rec["date"])
-        rec["start_time"] = _normalize_clock_str(rec.get("start_time"))
-        rec["end_time"] = _normalize_clock_str(rec.get("end_time"))
-        out.append(rec)
-    return out
-
-
-def _normalize_clock_str(v) -> str:
-    if v is None:
-        return ""
-    if isinstance(v, time):
-        return v.strftime("%H:%M")
-    if isinstance(v, datetime):
-        return v.time().strftime("%H:%M")
-    return str(v)
-
-
-def _append_appointment(appt: dict) -> None:
-    with _lock:
-        wb = openpyxl.load_workbook(SALON_XLSX)
-        ws = wb["Appointments"]
-        ws.append([appt.get(k) for k in _APPT_COLUMNS])
-        wb.save(SALON_XLSX)
-
-
-def _rewrite_appointments(appts: list[dict]) -> None:
-    """Replace the Appointments sheet contents wholesale. Called for edits/deletes."""
-    with _lock:
-        wb = openpyxl.load_workbook(SALON_XLSX)
-        # Drop-and-recreate is the simplest way to reset without leaving stale rows.
-        del wb["Appointments"]
-        ws = wb.create_sheet("Appointments")
-        ws.append(_APPT_COLUMNS)
-        for appt in appts:
-            ws.append([appt.get(k) for k in _APPT_COLUMNS])
-        wb.save(SALON_XLSX)
+def _appt_to_dict(a: Appointment) -> dict:
+    """Serialize an Appointment row to the same shape the xlsx code emitted."""
+    return {
+        "id": a.id,
+        "created_at": a.created_at.isoformat(timespec="seconds"),
+        "customer_name": a.customer_name,
+        "customer_phone": a.customer_phone,
+        "stylist": a.staff.name,
+        "service": a.service.name,
+        "date": a.date.isoformat(),
+        "start_time": a.start_time.strftime("%H:%M"),
+        "end_time": a.end_time.strftime("%H:%M"),
+        "session_id": a.session_id,
+    }
 
 
 # ---------- Public salon-context helper for the system prompt ----------
@@ -436,14 +329,14 @@ def _check_availability_sync(date_iso: str, stylist: str | None, service: str | 
 
     duration = SERVICE_DURATIONS_MIN.get(service_lc, 30)
 
-    booked = _read_appointments()
-    by_stylist: dict[str, list[tuple[time, time]]] = {}
-    for a in booked:
-        if str(a["date"]) != date_iso:
-            continue
-        by_stylist.setdefault(a["stylist"], []).append(
-            (_parse_clock(str(a["start_time"])), _parse_clock(str(a["end_time"])))
-        )
+    # Pull that day's bookings in a single query rather than every row.
+    with session_scope() as sess:
+        rows = sess.scalars(
+            select(Appointment).where(Appointment.date == d)
+        ).all()
+        by_stylist: dict[str, list[tuple[time, time]]] = {}
+        for a in rows:
+            by_stylist.setdefault(a.staff.name, []).append((a.start_time, a.end_time))
 
     result = []
     for s in candidates:
@@ -488,12 +381,7 @@ async def book_appointment(
     time_str: str,
     session_id: str | None = None,
 ) -> dict:
-    """Book and persist an appointment after re-checking availability.
-
-    `session_id` is the bot's per-call session identifier; when supplied it's
-    stored on the appointment so the observability UI can link a call to the
-    booking it produced.
-    """
+    """Book and persist an appointment after re-checking availability."""
     async with _async_lock:
         return await asyncio.to_thread(
             _book_appointment_sync,
@@ -554,33 +442,52 @@ def _book_appointment_sync(
     if start < salon_open or end > salon_close:
         return {"error": "Time is outside salon open hours."}
 
-    for a in _read_appointments():
-        if str(a["date"]) != date_iso or a["stylist"] != stylist_obj.name:
-            continue
-        ostart = _parse_clock(str(a["start_time"]))
-        oend = _parse_clock(str(a["end_time"]))
-        if _overlaps(start, end, ostart, oend):
-            return {"error": f"{stylist_obj.name} is already booked at {time_str}."}
+    with _lock:
+        with session_scope() as sess:
+            staff_row = sess.scalar(select(StaffRow).where(StaffRow.name == stylist_obj.name))
+            svc_row = sess.scalar(
+                select(ServiceRow).where(ServiceRow.name.ilike(service_lc))
+            )
+            if not staff_row or not svc_row:
+                # INFO cache said they existed; the DB says otherwise. Someone
+                # must have just deleted them in the admin UI. Reload and bail.
+                return {"error": "Stylist or service was just removed. Please try again."}
 
-    appt_id = uuid.uuid4().hex[:8]
-    _append_appointment({
-        "id": appt_id,
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "customer_name": customer_name,
-        "customer_phone": customer_phone,
-        "stylist": stylist_obj.name,
-        "service": service_lc.title(),
-        "date": date_iso,
-        "start_time": start.strftime("%H:%M"),
-        "end_time": end.strftime("%H:%M"),
-        "session_id": session_id,
-    })
+            # Capture display fields before the session closes — the row
+            # objects are detached from the session outside this block.
+            svc_display = svc_row.name
+
+            # Conflict check inside the same transaction, so a racing admin
+            # insert on this stylist's slot can't sneak past us.
+            conflicts = sess.scalars(
+                select(Appointment).where(
+                    Appointment.date == d,
+                    Appointment.staff_id == staff_row.id,
+                )
+            ).all()
+            for a in conflicts:
+                if _overlaps(start, end, a.start_time, a.end_time):
+                    return {"error": f"{stylist_obj.name} is already booked at {time_str}."}
+
+            appt_id = uuid.uuid4().hex[:8]
+            sess.add(Appointment(
+                id=appt_id,
+                created_at=datetime.now(),
+                customer_name=customer_name,
+                customer_phone=customer_phone,
+                staff_id=staff_row.id,
+                service_id=svc_row.id,
+                date=d,
+                start_time=start,
+                end_time=end,
+                session_id=session_id,
+            ))
 
     return {
         "ok": True,
         "appointment_id": appt_id,
         "summary": (
-            f"{service_lc.title()} with {stylist_obj.name} on {weekday} "
+            f"{svc_display} with {stylist_obj.name} on {weekday} "
             f"{date_iso} at {start.strftime('%I:%M %p').lstrip('0')} ({duration} minutes)."
         ),
     }
@@ -611,49 +518,6 @@ def list_staff() -> list[dict]:
             },
         })
     return out
-
-
-def _write_staff_sheets(staff: list[dict]) -> None:
-    """Rewrite the Associates and Schedule sheets from a normalized staff list."""
-    with _lock:
-        wb = openpyxl.load_workbook(SALON_XLSX)
-
-        # Associates: one row per person, up to 4 service columns (matches
-        # the existing shape). We compute the width from the data so the
-        # sheet grows if we ever exceed 4.
-        if "Associates" in wb.sheetnames:
-            del wb["Associates"]
-        ws = wb.create_sheet("Associates")
-        max_services = max((len(s.get("services", [])) for s in staff), default=0)
-        max_services = max(max_services, 4)
-        header = ["Name"] + [f"Service {i+1}" for i in range(max_services)]
-        ws.append(header)
-        for s in staff:
-            services = list(s.get("services", []))
-            row = [s["name"]] + [
-                (services[i].title() if i < len(services) else None)
-                for i in range(max_services)
-            ]
-            ws.append(row)
-
-        # Schedule: columns are weekdays, rows are people, cells are ranges.
-        if "Schedule" in wb.sheetnames:
-            del wb["Schedule"]
-        ws = wb.create_sheet("Schedule")
-        ws.append([None] + WEEKDAYS)
-        for s in staff:
-            row = [s["name"]]
-            for day in WEEKDAYS:
-                slot = s.get("schedule", {}).get(day)
-                if slot and slot.get("start") and slot.get("end"):
-                    start = _parse_clock(slot["start"])
-                    end = _parse_clock(slot["end"])
-                    row.append(_fmt_range(start, end))
-                else:
-                    row.append(None)
-            ws.append(row)
-
-        wb.save(SALON_XLSX)
 
 
 def _validate_staff_payload(s: dict) -> None:
@@ -699,15 +563,58 @@ def _normalize_staff(s: dict) -> dict:
     return {"name": s["name"].strip(), "services": services, "schedule": schedule}
 
 
+def _apply_staff_payload(sess: Session, staff: StaffRow, payload: dict) -> None:
+    """Overwrite ``staff``'s services and schedule from a normalized payload."""
+    staff.name = payload["name"]
+
+    # Services — resolve names to Service rows. Unknown names are errors
+    # rather than silent skips so a typo in the admin UI surfaces fast.
+    wanted_lc = payload["services"]
+    if wanted_lc:
+        svc_rows = sess.scalars(
+            select(ServiceRow).where(
+                ServiceRow.name.in_([n.title() for n in wanted_lc])
+                | ServiceRow.name.in_(wanted_lc)
+            )
+        ).all()
+        found_lc = {r.name.lower() for r in svc_rows}
+        missing = [n for n in wanted_lc if n not in found_lc]
+        if missing:
+            raise ValueError(f"Unknown service(s): {', '.join(missing)}.")
+        staff.services = list(svc_rows)
+    else:
+        staff.services = []
+
+    # Schedule — drop and rebuild. Simpler than diffing, and the row count
+    # per staff member maxes out at 7.
+    for h in list(staff.hours):
+        sess.delete(h)
+    sess.flush()  # actually delete rows before we insert to avoid UNIQUE clash
+    for day, slot in payload["schedule"].items():
+        staff.hours.append(StaffHoursRow(
+            weekday=day,
+            start=_parse_clock(slot["start"]),
+            end=_parse_clock(slot["end"]),
+        ))
+
+
 def create_staff(payload: dict) -> dict:
     _validate_staff_payload(payload)
     payload = _normalize_staff(payload)
     with _lock:
-        current = list_staff()
-        if any(m["name"].lower() == payload["name"].lower() for m in current):
-            raise ValueError(f"Staff member {payload['name']!r} already exists.")
-        current.append(payload)
-        _write_staff_sheets(current)
+        try:
+            with session_scope() as sess:
+                existing = sess.scalar(
+                    select(StaffRow).where(StaffRow.name.ilike(payload["name"]))
+                )
+                if existing:
+                    raise ValueError(f"Staff member {payload['name']!r} already exists.")
+                staff = StaffRow(name=payload["name"])
+                sess.add(staff)
+                sess.flush()
+                _apply_staff_payload(sess, staff, payload)
+        except IntegrityError as e:
+            raise ValueError(f"Staff member {payload['name']!r} already exists.") from e
     reload()
     return payload
 
@@ -716,28 +623,40 @@ def update_staff(name: str, payload: dict) -> dict:
     _validate_staff_payload(payload)
     payload = _normalize_staff(payload)
     with _lock:
-        current = list_staff()
-        idx = next((i for i, m in enumerate(current) if m["name"].lower() == name.lower()), None)
-        if idx is None:
-            raise KeyError(f"Staff member {name!r} not found.")
-        # If the caller renamed the person, make sure the new name isn't taken.
-        if payload["name"].lower() != name.lower() and any(
-            m["name"].lower() == payload["name"].lower() for m in current
-        ):
-            raise ValueError(f"Staff member {payload['name']!r} already exists.")
-        current[idx] = payload
-        _write_staff_sheets(current)
+        with session_scope() as sess:
+            staff = sess.scalar(select(StaffRow).where(StaffRow.name.ilike(name)))
+            if staff is None:
+                raise KeyError(f"Staff member {name!r} not found.")
+            if payload["name"].lower() != staff.name.lower():
+                clash = sess.scalar(
+                    select(StaffRow).where(StaffRow.name.ilike(payload["name"]))
+                )
+                if clash is not None:
+                    raise ValueError(f"Staff member {payload['name']!r} already exists.")
+            _apply_staff_payload(sess, staff, payload)
     reload()
     return payload
 
 
 def delete_staff(name: str) -> None:
     with _lock:
-        current = list_staff()
-        remaining = [m for m in current if m["name"].lower() != name.lower()]
-        if len(remaining) == len(current):
-            raise KeyError(f"Staff member {name!r} not found.")
-        _write_staff_sheets(remaining)
+        with session_scope() as sess:
+            staff = sess.scalar(select(StaffRow).where(StaffRow.name.ilike(name)))
+            if staff is None:
+                raise KeyError(f"Staff member {name!r} not found.")
+            # RESTRICT would also block on historical appointments (which we
+            # want to keep). Surface a friendly error so the admin knows to
+            # delete or reassign them first, rather than seeing an
+            # IntegrityError bubble up as an opaque 500.
+            has_any = sess.scalar(
+                select(Appointment.id).where(Appointment.staff_id == staff.id).limit(1)
+            )
+            if has_any:
+                raise ValueError(
+                    f"Cannot delete {staff.name!r}: they still have appointments on file. "
+                    f"Delete or reassign those appointments first."
+                )
+            sess.delete(staff)
     reload()
 
 
@@ -749,18 +668,6 @@ def list_services() -> list[dict]:
         {"name": svc.name, "duration_minutes": svc.duration_minutes, "price": svc.price}
         for svc in INFO.services.values()
     ]
-
-
-def _write_services_sheet(services: Iterable[dict]) -> None:
-    with _lock:
-        wb = openpyxl.load_workbook(SALON_XLSX)
-        if "Services" in wb.sheetnames:
-            del wb["Services"]
-        ws = wb.create_sheet("Services")
-        ws.append(["name", "duration_minutes", "price"])
-        for svc in services:
-            ws.append([svc["name"], int(svc["duration_minutes"]), float(svc["price"])])
-        wb.save(SALON_XLSX)
 
 
 def _validate_service_payload(s: dict) -> None:
@@ -794,11 +701,20 @@ def create_service(payload: dict) -> dict:
     _validate_service_payload(payload)
     payload = _normalize_service(payload)
     with _lock:
-        current = list_services()
-        if any(svc["name"].lower() == payload["name"].lower() for svc in current):
-            raise ValueError(f"Service {payload['name']!r} already exists.")
-        current.append(payload)
-        _write_services_sheet(current)
+        try:
+            with session_scope() as sess:
+                existing = sess.scalar(
+                    select(ServiceRow).where(ServiceRow.name.ilike(payload["name"]))
+                )
+                if existing:
+                    raise ValueError(f"Service {payload['name']!r} already exists.")
+                sess.add(ServiceRow(
+                    name=payload["name"],
+                    duration_minutes=payload["duration_minutes"],
+                    price=payload["price"],
+                ))
+        except IntegrityError as e:
+            raise ValueError(f"Service {payload['name']!r} already exists.") from e
     reload()
     return payload
 
@@ -807,30 +723,38 @@ def update_service(name: str, payload: dict) -> dict:
     _validate_service_payload(payload)
     payload = _normalize_service(payload)
     with _lock:
-        current = list_services()
-        idx = next(
-            (i for i, svc in enumerate(current) if svc["name"].lower() == name.lower()),
-            None,
-        )
-        if idx is None:
-            raise KeyError(f"Service {name!r} not found.")
-        if payload["name"].lower() != name.lower() and any(
-            svc["name"].lower() == payload["name"].lower() for svc in current
-        ):
-            raise ValueError(f"Service {payload['name']!r} already exists.")
-        current[idx] = payload
-        _write_services_sheet(current)
+        with session_scope() as sess:
+            svc = sess.scalar(select(ServiceRow).where(ServiceRow.name.ilike(name)))
+            if svc is None:
+                raise KeyError(f"Service {name!r} not found.")
+            if payload["name"].lower() != svc.name.lower():
+                clash = sess.scalar(
+                    select(ServiceRow).where(ServiceRow.name.ilike(payload["name"]))
+                )
+                if clash is not None:
+                    raise ValueError(f"Service {payload['name']!r} already exists.")
+            svc.name = payload["name"]
+            svc.duration_minutes = payload["duration_minutes"]
+            svc.price = payload["price"]
     reload()
     return payload
 
 
 def delete_service(name: str) -> None:
     with _lock:
-        current = list_services()
-        remaining = [svc for svc in current if svc["name"].lower() != name.lower()]
-        if len(remaining) == len(current):
-            raise KeyError(f"Service {name!r} not found.")
-        _write_services_sheet(remaining)
+        with session_scope() as sess:
+            svc = sess.scalar(select(ServiceRow).where(ServiceRow.name.ilike(name)))
+            if svc is None:
+                raise KeyError(f"Service {name!r} not found.")
+            has_any = sess.scalar(
+                select(Appointment.id).where(Appointment.service_id == svc.id).limit(1)
+            )
+            if has_any:
+                raise ValueError(
+                    f"Cannot delete {svc.name!r}: it is used by existing appointments. "
+                    f"Delete those appointments first."
+                )
+            sess.delete(svc)
     reload()
 
 
@@ -849,15 +773,8 @@ def get_hours() -> dict[str, dict | None]:
     return out
 
 
-def _fmt_hour_sheet(t: time) -> str:
-    """Match the existing '10AM'/'7PM' format the Hours sheet already uses."""
-    suffix = "AM" if t.hour < 12 else "PM"
-    h = t.hour % 12 or 12
-    return f"{h}{suffix}" if t.minute == 0 else f"{h}:{t.minute:02d}{suffix}"
-
-
 def update_hours(payload: dict[str, dict | None]) -> dict:
-    """Overwrite the Hours sheet from a {day: {open, close} | None} dict."""
+    """Overwrite all hours rows from a {day: {open, close} | None} dict."""
     parsed: dict[str, tuple[time, time] | None] = {}
     for day in WEEKDAYS:
         slot = payload.get(day) if isinstance(payload, dict) else None
@@ -874,18 +791,15 @@ def update_hours(payload: dict[str, dict | None]) -> dict:
         parsed[day] = (o, c)
 
     with _lock:
-        wb = openpyxl.load_workbook(SALON_XLSX)
-        if "Hours" in wb.sheetnames:
-            del wb["Hours"]
-        ws = wb.create_sheet("Hours")
-        ws.append(["Day", "Open", "Close"])
-        for day in WEEKDAYS:
-            slot = parsed[day]
-            if slot is None:
-                ws.append([day, "NA", "NA"])
-            else:
-                ws.append([day, _fmt_hour_sheet(slot[0]), _fmt_hour_sheet(slot[1])])
-        wb.save(SALON_XLSX)
+        with session_scope() as sess:
+            # Wipe and re-insert. Seven rows; no point in a diff.
+            sess.execute(delete(HoursRow))
+            for day in WEEKDAYS:
+                slot = parsed[day]
+                if slot is None:
+                    sess.add(HoursRow(weekday=day, open=None, close=None))
+                else:
+                    sess.add(HoursRow(weekday=day, open=slot[0], close=slot[1]))
     reload()
     return get_hours()
 
@@ -898,13 +812,12 @@ def update_location(location: str) -> str:
     if not isinstance(location, str):
         raise ValueError("location must be a string.")
     with _lock:
-        wb = openpyxl.load_workbook(SALON_XLSX)
-        if "Location" in wb.sheetnames:
-            del wb["Location"]
-        ws = wb.create_sheet("Location")
-        ws.append(["Locations", None])
-        ws.append(["Location 1", location.strip()])
-        wb.save(SALON_XLSX)
+        with session_scope() as sess:
+            salon_row = sess.scalar(select(SalonRow).order_by(SalonRow.id).limit(1))
+            if salon_row is None:
+                sess.add(SalonRow(id=1, location=location.strip()))
+            else:
+                salon_row.location = location.strip()
     reload()
     return get_location()
 
@@ -916,20 +829,13 @@ def list_appointments(start: str | None = None, end: str | None = None) -> list[
     """Return appointments in [start, end] (inclusive). Both are optional."""
     start_d = _parse_date(start) if start else None
     end_d = _parse_date(end) if end else None
-    out = []
-    for a in _read_appointments():
-        try:
-            d = _parse_date(str(a["date"]))
-        except ValueError:
-            continue
-        if start_d and d < start_d:
-            continue
-        if end_d and d > end_d:
-            continue
-        out.append(a)
-    # Sort so the UI doesn't have to.
-    out.sort(key=lambda a: (a["date"], a["start_time"]))
-    return out
+    with session_scope() as sess:
+        stmt = select(Appointment).order_by(Appointment.date, Appointment.start_time)
+        if start_d is not None:
+            stmt = stmt.where(Appointment.date >= start_d)
+        if end_d is not None:
+            stmt = stmt.where(Appointment.date <= end_d)
+        return [_appt_to_dict(a) for a in sess.scalars(stmt)]
 
 
 def _validate_appointment_payload(a: dict, *, require_id: bool = False) -> None:
@@ -958,74 +864,149 @@ def _end_from_service(service: str, start_time: str) -> str:
     return end_dt.time().strftime("%H:%M")
 
 
+def _resolve_staff_and_service(
+    sess: Session, stylist_name: str, service_name: str
+) -> tuple[StaffRow, ServiceRow]:
+    staff = sess.scalar(select(StaffRow).where(StaffRow.name.ilike(stylist_name.strip())))
+    if staff is None:
+        raise ValueError(f"Unknown stylist {stylist_name!r}.")
+    svc = sess.scalar(select(ServiceRow).where(ServiceRow.name.ilike(service_name.strip())))
+    if svc is None:
+        raise ValueError(f"Unknown service {service_name!r}.")
+    return staff, svc
+
+
+def _admin_conflict_query(
+    sess: Session,
+    *,
+    when: date,
+    staff_id: int,
+    start: time,
+    end: time,
+    exclude_id: str | None = None,
+) -> None:
+    """Raise ValueError if any other appointment overlaps this slot."""
+    stmt = select(Appointment).where(
+        Appointment.date == when,
+        Appointment.staff_id == staff_id,
+    )
+    if exclude_id is not None:
+        stmt = stmt.where(Appointment.id != exclude_id)
+    for a in sess.scalars(stmt):
+        if _overlaps(start, end, a.start_time, a.end_time):
+            raise ValueError(
+                f"{a.staff.name} is already booked at "
+                f"{a.start_time.strftime('%H:%M')}-{a.end_time.strftime('%H:%M')} "
+                f"on {when.isoformat()}."
+            )
+
+
 def create_appointment(payload: dict) -> dict:
     _validate_appointment_payload(payload)
     with _lock:
-        existing = _read_appointments()
-        appt = {
-            "id": uuid.uuid4().hex[:8],
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "customer_name": payload["customer_name"].strip(),
-            "customer_phone": payload["customer_phone"].strip(),
-            "stylist": payload["stylist"].strip(),
-            "service": payload["service"].strip().title(),
-            "date": str(payload["date"]),
-            "start_time": _parse_clock(payload["start_time"]).strftime("%H:%M"),
-            "end_time": payload.get("end_time") or _end_from_service(
+        with session_scope() as sess:
+            staff, svc = _resolve_staff_and_service(
+                sess, payload["stylist"], payload["service"]
+            )
+            d = _parse_date(str(payload["date"]))
+            start = _parse_clock(payload["start_time"])
+            end_str = payload.get("end_time") or _end_from_service(
                 payload["service"], payload["start_time"]
-            ),
-        }
-        _check_admin_conflict(appt, existing)
-        _append_appointment(appt)
-    return appt
+            )
+            end = _parse_clock(end_str)
+            _admin_conflict_query(
+                sess, when=d, staff_id=staff.id, start=start, end=end
+            )
+            appt = Appointment(
+                id=uuid.uuid4().hex[:8],
+                created_at=datetime.now(),
+                customer_name=payload["customer_name"].strip(),
+                customer_phone=payload["customer_phone"].strip(),
+                staff_id=staff.id,
+                service_id=svc.id,
+                date=d,
+                start_time=start,
+                end_time=end,
+            )
+            sess.add(appt)
+            sess.flush()
+            sess.refresh(appt)
+            return _appt_to_dict(appt)
 
 
 def update_appointment(appt_id: str, payload: dict) -> dict:
     _validate_appointment_payload(payload)
     with _lock:
-        existing = _read_appointments()
-        idx = next((i for i, a in enumerate(existing) if a["id"] == appt_id), None)
-        if idx is None:
-            raise KeyError(f"Appointment {appt_id!r} not found.")
-        appt = {
-            **existing[idx],
-            "customer_name": payload["customer_name"].strip(),
-            "customer_phone": payload["customer_phone"].strip(),
-            "stylist": payload["stylist"].strip(),
-            "service": payload["service"].strip().title(),
-            "date": str(payload["date"]),
-            "start_time": _parse_clock(payload["start_time"]).strftime("%H:%M"),
-        }
-        appt["end_time"] = payload.get("end_time") or _end_from_service(
-            payload["service"], payload["start_time"]
-        )
-        others = [a for i, a in enumerate(existing) if i != idx]
-        _check_admin_conflict(appt, others)
-        others.insert(idx, appt)
-        _rewrite_appointments(others)
-    return appt
+        with session_scope() as sess:
+            appt = sess.get(Appointment, appt_id)
+            if appt is None:
+                raise KeyError(f"Appointment {appt_id!r} not found.")
+            staff, svc = _resolve_staff_and_service(
+                sess, payload["stylist"], payload["service"]
+            )
+            d = _parse_date(str(payload["date"]))
+            start = _parse_clock(payload["start_time"])
+            end_str = payload.get("end_time") or _end_from_service(
+                payload["service"], payload["start_time"]
+            )
+            end = _parse_clock(end_str)
+            _admin_conflict_query(
+                sess, when=d, staff_id=staff.id, start=start, end=end,
+                exclude_id=appt_id,
+            )
+            appt.customer_name = payload["customer_name"].strip()
+            appt.customer_phone = payload["customer_phone"].strip()
+            appt.staff_id = staff.id
+            appt.service_id = svc.id
+            appt.date = d
+            appt.start_time = start
+            appt.end_time = end
+            sess.flush()
+            sess.refresh(appt)
+            return _appt_to_dict(appt)
 
 
 def delete_appointment(appt_id: str) -> None:
     with _lock:
-        existing = _read_appointments()
-        remaining = [a for a in existing if a["id"] != appt_id]
-        if len(remaining) == len(existing):
-            raise KeyError(f"Appointment {appt_id!r} not found.")
-        _rewrite_appointments(remaining)
+        with session_scope() as sess:
+            appt = sess.get(Appointment, appt_id)
+            if appt is None:
+                raise KeyError(f"Appointment {appt_id!r} not found.")
+            sess.delete(appt)
 
 
-def _check_admin_conflict(new: dict, existing: list[dict]) -> None:
-    """Block obvious double-bookings when the admin schedules by hand."""
-    start = _parse_clock(new["start_time"])
-    end = _parse_clock(new["end_time"])
-    for a in existing:
-        if a["date"] != new["date"] or a["stylist"] != new["stylist"]:
-            continue
-        ostart = _parse_clock(a["start_time"])
-        oend = _parse_clock(a["end_time"])
-        if _overlaps(start, end, ostart, oend):
-            raise ValueError(
-                f"{new['stylist']} is already booked at "
-                f"{a['start_time']}-{a['end_time']} on {new['date']}."
-            )
+# ---------- Compat re-exports for the import/export CLIs ----------
+#
+# The xlsx-side helpers below are shared with import_xlsx.py / export_xlsx.py
+# so they can round-trip data using the same parsers we use everywhere.
+
+
+__all__ = [
+    "WEEKDAYS",
+    "SLOT_MIN",
+    "Service",
+    "Stylist",
+    "SalonInfo",
+    "INFO",
+    "SERVICE_DURATIONS_MIN",
+    "reload",
+    "system_prompt_context",
+    "check_availability",
+    "book_appointment",
+    "list_staff",
+    "create_staff",
+    "update_staff",
+    "delete_staff",
+    "list_services",
+    "create_service",
+    "update_service",
+    "delete_service",
+    "get_hours",
+    "update_hours",
+    "get_location",
+    "update_location",
+    "list_appointments",
+    "create_appointment",
+    "update_appointment",
+    "delete_appointment",
+]

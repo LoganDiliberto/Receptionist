@@ -32,6 +32,12 @@ admin-ui/out-tsc/
 voices/*.onnx
 voices/*.onnx.json
 
+# Local SQLite DB — production uses a separate one on the Fly volume.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 # OS / editor cruft.
 .DS_Store
 Thumbs.db

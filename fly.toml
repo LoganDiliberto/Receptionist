@@ -18,10 +18,15 @@ primary_region = "iad"
 [env]
   HOST = "0.0.0.0"
   PORT = "8080"
+  # Primary datastore. Alembic migrations run on every boot; ``entrypoint.sh``
+  # imports the legacy workbook exactly once and renames it to *.imported.
+  SALON_DB_PATH = "/data/receptionist.db"
+  # Kept for backwards compat with volumes provisioned before Phase 1 —
+  # entrypoint.sh reads from this path exactly once, then renames the file.
   SALON_DATA_PATH = "/data/ReceptionistData.xlsx"
 
-# Persistent, per-machine volume for the Excel workbook (and anything else
-# we want to survive `fly deploy`, like the transcripts log). Create it once:
+# Persistent, per-machine volume for the SQLite DB (and the legacy xlsx
+# for one-shot migration on the very first Phase 1 boot). Create it once:
 #   fly volumes create receptionist_data --region iad --size 1
 [mounts]
   source = "receptionist_data"

@@ -14,3 +14,9 @@ admin-ui/node_modules/
 admin-ui/dist/
 admin-ui/.angular/
 admin-ui/out-tsc/
+
+# Local SQLite database (production DB lives on the Fly persistent volume)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
