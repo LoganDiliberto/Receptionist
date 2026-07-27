@@ -40,6 +40,7 @@ from sqlalchemy.orm import Session, selectinload
 from db import session_scope
 from models import (
     Appointment,
+    Client as ClientRow,
     Hours as HoursRow,
     Salon as SalonRow,
     Service as ServiceRow,
@@ -97,6 +98,43 @@ def _weekday_name(d: date) -> str:
     # Python's Monday=0, Sunday=6.
     return ["Monday", "Tuesday", "Wednesday", "Thursday",
             "Friday", "Saturday", "Sunday"][d.weekday()]
+
+
+def normalize_phone(raw: str | None) -> str:
+    """Reduce any US phone number to its canonical storage form.
+
+    Strips every non-digit character and keeps only the last 10 digits so
+    the following all compare equal in the DB:
+
+        +1 (203) 359-4344   ->  2033594344
+        1-203-359-4344      ->  2033594344
+        203.359.4344        ->  2033594344
+        2033594344          ->  2033594344
+
+    Returns ``""`` for anything with fewer than 10 digits (empty string,
+    obviously-wrong input, etc). Callers that need to distinguish "no
+    phone" from "bad phone" should check the raw input themselves before
+    calling this.
+    """
+    if not raw:
+        return ""
+    digits = re.sub(r"\D", "", raw)
+    return digits[-10:] if len(digits) >= 10 else ""
+
+
+def format_phone(normalized: str | None) -> str:
+    """Render a normalized 10-digit phone the way a person would say it.
+
+    ``"2033594344"`` -> ``"(203) 359-4344"``. Falls back to the input as-is
+    for anything that isn't a clean 10-digit number so we never crash a
+    system-prompt render on unexpected data.
+    """
+    if not normalized:
+        return ""
+    digits = re.sub(r"\D", "", normalized)
+    if len(digits) != 10:
+        return normalized
+    return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
 
 
 def _fmt_range(start: time, end: time) -> str:
@@ -215,7 +253,13 @@ def reload() -> None:
 
 
 def _appt_to_dict(a: Appointment) -> dict:
-    """Serialize an Appointment row to the same shape the xlsx code emitted."""
+    """Serialize an Appointment row to a JSON-friendly dict.
+
+    The old xlsx-era shape is preserved (existing UI keys unchanged),
+    with two Phase-2 additions: ``client_id`` and (when the appointment
+    is linked to a client) ``client``, a small nested object the admin
+    UI can render as a "known caller" badge.
+    """
     return {
         "id": a.id,
         "created_at": a.created_at.isoformat(timespec="seconds"),
@@ -227,6 +271,18 @@ def _appt_to_dict(a: Appointment) -> dict:
         "start_time": a.start_time.strftime("%H:%M"),
         "end_time": a.end_time.strftime("%H:%M"),
         "session_id": a.session_id,
+        "client_id": a.client_id,
+        "client": (
+            {
+                "id": a.client.id,
+                "first_name": a.client.first_name,
+                "last_name": a.client.last_name,
+                "phone": a.client.phone,
+                "phone_formatted": format_phone(a.client.phone),
+            }
+            if a.client is not None
+            else None
+        ),
     }
 
 
@@ -975,6 +1031,252 @@ def delete_appointment(appt_id: str) -> None:
             sess.delete(appt)
 
 
+# ---------- Clients (Phase 2) ----------
+#
+# The bot uses ``get_client_by_phone`` on every call; admin CRUD is
+# exposed through /api/clients. Clients are keyed by normalized phone
+# (see ``normalize_phone``).
+
+
+_ALLOWED_GENDERS = ("male", "female", "nonbinary", "unspecified")
+
+
+def _client_to_dict(c: ClientRow) -> dict:
+    return {
+        "id": c.id,
+        "first_name": c.first_name,
+        "last_name": c.last_name,
+        "phone": c.phone,
+        "phone_formatted": format_phone(c.phone),
+        "email": c.email,
+        "gender": c.gender,
+        "notes": c.notes,
+        "created_at": c.created_at.isoformat(timespec="seconds"),
+        "updated_at": c.updated_at.isoformat(timespec="seconds"),
+    }
+
+
+def _validate_client_payload(c: dict) -> None:
+    if not isinstance(c.get("first_name"), str) and c.get("first_name") is not None:
+        raise ValueError("first_name must be a string.")
+    if not isinstance(c.get("last_name"), str) and c.get("last_name") is not None:
+        raise ValueError("last_name must be a string.")
+    phone = c.get("phone")
+    if not phone or not str(phone).strip():
+        raise ValueError("phone is required.")
+    if not normalize_phone(str(phone)):
+        raise ValueError(
+            f"phone {phone!r} doesn't look like a US number "
+            f"(need at least 10 digits)."
+        )
+    gender = c.get("gender")
+    if gender and gender not in _ALLOWED_GENDERS:
+        raise ValueError(
+            f"gender must be one of {_ALLOWED_GENDERS}, got {gender!r}."
+        )
+
+
+def _normalize_client(c: dict) -> dict:
+    """Trim strings, normalize phone, coerce empties to None where the column is nullable."""
+    def _s(k: str) -> str:
+        v = c.get(k)
+        return str(v).strip() if v is not None else ""
+
+    def _opt(k: str) -> str | None:
+        v = c.get(k)
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    return {
+        "first_name": _s("first_name"),
+        "last_name": _s("last_name"),
+        "phone": normalize_phone(str(c.get("phone") or "")),
+        "email": _opt("email"),
+        "gender": _opt("gender"),
+        "notes": _opt("notes"),
+    }
+
+
+def list_clients(query: str | None = None) -> list[dict]:
+    """Return all clients, most recently updated first.
+
+    ``query``, when passed, does a case-insensitive substring match on
+    first/last name and a digits-only substring match on phone. Small
+    salons will never have more than a few thousand clients, so a full
+    scan is fine; when this stops being fine we'll add a FTS index.
+    """
+    with session_scope() as sess:
+        rows = sess.scalars(
+            select(ClientRow).order_by(ClientRow.updated_at.desc())
+        ).all()
+
+        if not query:
+            return [_client_to_dict(c) for c in rows]
+
+        # Convert inside the session — otherwise commit expires the
+        # attributes and _client_to_dict trips DetachedInstanceError.
+        q_lower = query.strip().lower()
+        q_digits = re.sub(r"\D", "", query)
+        out: list[dict] = []
+        for c in rows:
+            name = f"{c.first_name} {c.last_name}".lower()
+            if q_lower and q_lower in name:
+                out.append(_client_to_dict(c))
+            elif q_digits and q_digits in c.phone:
+                out.append(_client_to_dict(c))
+        return out
+
+
+def get_client(client_id: int) -> dict | None:
+    with session_scope() as sess:
+        c = sess.get(ClientRow, client_id)
+        return _client_to_dict(c) if c else None
+
+
+def get_client_by_phone(phone: str) -> dict | None:
+    """Look up a client by any phone-shaped string. Returns ``None`` on miss."""
+    normalized = normalize_phone(phone)
+    if not normalized:
+        return None
+    with session_scope() as sess:
+        c = sess.scalar(select(ClientRow).where(ClientRow.phone == normalized))
+        return _client_to_dict(c) if c else None
+
+
+def client_history(client_id: int, *, upcoming_only: bool = False) -> list[dict]:
+    """Return this client's appointments, most recent first.
+
+    Used by both the admin UI (full history on the client detail page)
+    and the bot (only ``upcoming_only=True`` for the caller-context
+    block so we don't page a huge history into the system prompt).
+    """
+    with session_scope() as sess:
+        stmt = select(Appointment).where(Appointment.client_id == client_id)
+        if upcoming_only:
+            stmt = stmt.where(Appointment.date >= date.today())
+        stmt = stmt.order_by(Appointment.date.desc(), Appointment.start_time.desc())
+        return [_appt_to_dict(a) for a in sess.scalars(stmt)]
+
+
+def create_client(payload: dict) -> dict:
+    _validate_client_payload(payload)
+    data = _normalize_client(payload)
+    now = datetime.now()
+    with _lock:
+        try:
+            with session_scope() as sess:
+                existing = sess.scalar(
+                    select(ClientRow).where(ClientRow.phone == data["phone"])
+                )
+                if existing:
+                    raise ValueError(
+                        f"A client with phone {format_phone(data['phone'])} "
+                        f"already exists (id={existing.id})."
+                    )
+                client = ClientRow(
+                    **data,
+                    created_at=now,
+                    updated_at=now,
+                )
+                sess.add(client)
+                sess.flush()
+                return _client_to_dict(client)
+        except IntegrityError as e:
+            raise ValueError(
+                f"A client with phone {format_phone(data['phone'])} already exists."
+            ) from e
+
+
+def update_client(client_id: int, payload: dict) -> dict:
+    _validate_client_payload(payload)
+    data = _normalize_client(payload)
+    with _lock:
+        with session_scope() as sess:
+            client = sess.get(ClientRow, client_id)
+            if client is None:
+                raise KeyError(f"Client {client_id!r} not found.")
+            if data["phone"] != client.phone:
+                clash = sess.scalar(
+                    select(ClientRow).where(
+                        ClientRow.phone == data["phone"],
+                        ClientRow.id != client_id,
+                    )
+                )
+                if clash is not None:
+                    raise ValueError(
+                        f"Another client already uses phone "
+                        f"{format_phone(data['phone'])} (id={clash.id})."
+                    )
+            for k, v in data.items():
+                setattr(client, k, v)
+            client.updated_at = datetime.now()
+            sess.flush()
+            return _client_to_dict(client)
+
+
+def delete_client(client_id: int) -> None:
+    """Delete a client. Their historical appointments survive (client_id -> NULL)."""
+    with _lock:
+        with session_scope() as sess:
+            client = sess.get(ClientRow, client_id)
+            if client is None:
+                raise KeyError(f"Client {client_id!r} not found.")
+            sess.delete(client)
+
+
+def upsert_client_from_call(
+    phone: str,
+    *,
+    customer_name: str | None = None,
+) -> dict | None:
+    """Given a caller's phone + optional name, ensure a client row exists.
+
+    Called from ``book_appointment`` so a first-time caller gets a
+    Clients row created as a side effect of booking. Returns the client
+    dict (existing or new) or ``None`` if the phone couldn't be
+    normalized.
+    """
+    normalized = normalize_phone(phone)
+    if not normalized:
+        return None
+
+    # Split "First Last" into two columns. Everything after the first
+    # space becomes last name; single-word names go entirely into first.
+    first = ""
+    last = ""
+    if customer_name:
+        parts = customer_name.strip().split(maxsplit=1)
+        first = parts[0] if parts else ""
+        last = parts[1] if len(parts) > 1 else ""
+
+    now = datetime.now()
+    with _lock:
+        with session_scope() as sess:
+            client = sess.scalar(select(ClientRow).where(ClientRow.phone == normalized))
+            if client is None:
+                client = ClientRow(
+                    first_name=first,
+                    last_name=last,
+                    phone=normalized,
+                    created_at=now,
+                    updated_at=now,
+                )
+                sess.add(client)
+                sess.flush()
+            else:
+                # Fill in any missing name info from this call. Never
+                # overwrite an existing name — the admin's edits win.
+                if first and not client.first_name:
+                    client.first_name = first
+                    client.updated_at = now
+                if last and not client.last_name:
+                    client.last_name = last
+                    client.updated_at = now
+            return _client_to_dict(client)
+
+
 # ---------- Compat re-exports for the import/export CLIs ----------
 #
 # The xlsx-side helpers below are shared with import_xlsx.py / export_xlsx.py
@@ -990,6 +1292,8 @@ __all__ = [
     "INFO",
     "SERVICE_DURATIONS_MIN",
     "reload",
+    "normalize_phone",
+    "format_phone",
     "system_prompt_context",
     "check_availability",
     "book_appointment",
@@ -1009,4 +1313,12 @@ __all__ = [
     "create_appointment",
     "update_appointment",
     "delete_appointment",
+    "list_clients",
+    "get_client",
+    "get_client_by_phone",
+    "client_history",
+    "create_client",
+    "update_client",
+    "delete_client",
+    "upsert_client_from_call",
 ]
