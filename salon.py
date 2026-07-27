@@ -327,6 +327,82 @@ def system_prompt_context() -> str:
     return "\n".join(lines)
 
 
+def caller_context(caller_phone: str | None) -> str:
+    """Render a per-call "who's on the line" block for the system prompt.
+
+    Returns a string that either identifies a returning caller (with a
+    short appointment history) or flags them as new. Always safe to
+    inject verbatim — never raises. When ``caller_phone`` is ``None``
+    (e.g. the browser test transport) the block explains that so the
+    LLM doesn't try to reference a caller number that doesn't exist.
+    """
+    if not caller_phone:
+        return (
+            "CALLER INFO:\n"
+            "  Phone number: unknown (browser test session, no caller ID).\n"
+            "  On file: N/A."
+        )
+
+    normalized = normalize_phone(caller_phone)
+    if not normalized:
+        return (
+            f"CALLER INFO:\n"
+            f"  Phone number: {caller_phone} (couldn't parse — treat as unknown).\n"
+            f"  On file: No."
+        )
+
+    formatted = format_phone(normalized)
+    client = get_client_by_phone(normalized)
+    if client is None:
+        return (
+            f"CALLER INFO:\n"
+            f"  Phone number: {formatted}\n"
+            f"  On file: No — this is a new caller. Collect their full "
+            f"name during booking, but DO NOT ask for a callback phone "
+            f"number — we already have it above."
+        )
+
+    full_name = f"{client['first_name']} {client['last_name']}".strip()
+    lines = [
+        "CALLER INFO:",
+        f"  Phone number: {formatted}",
+        "  On file: Yes",
+        f"  Name: {full_name or '(no name on file)'}",
+    ]
+    if client.get("gender"):
+        lines.append(f"  Gender: {client['gender']}")
+    if client.get("notes"):
+        # Truncate long notes so a stylist's essay doesn't dominate the
+        # system prompt and blow the LLM's attention budget.
+        notes = str(client["notes"]).strip()
+        if len(notes) > 300:
+            notes = notes[:297] + "..."
+        lines.append(f"  Notes: {notes}")
+
+    # Upcoming (client_history with upcoming_only=True) + last 3 past for context.
+    upcoming = client_history(client["id"], upcoming_only=True)
+    all_history = client_history(client["id"])
+    past = [a for a in all_history if a["date"] < date.today().isoformat()][:3]
+
+    if upcoming:
+        lines.append("  Upcoming appointments:")
+        for a in upcoming:
+            lines.append(
+                f"    - {a['service']} with {a['stylist']} on "
+                f"{a['date']} at {a['start_time']}"
+            )
+    else:
+        lines.append("  Upcoming appointments: none")
+
+    if past:
+        lines.append("  Recent past appointments (last 3):")
+        for a in past:
+            lines.append(
+                f"    - {a['service']} with {a['stylist']} on {a['date']}"
+            )
+    return "\n".join(lines)
+
+
 # ---------- Slot math ----------
 
 
@@ -436,13 +512,22 @@ async def book_appointment(
     date_iso: str,
     time_str: str,
     session_id: str | None = None,
+    caller_phone: str | None = None,
 ) -> dict:
-    """Book and persist an appointment after re-checking availability."""
+    """Book and persist an appointment after re-checking availability.
+
+    ``caller_phone``, when provided, takes precedence over
+    ``customer_phone`` for the client link — Twilio told us the true
+    number the call is coming from, whereas the LLM may have parsed the
+    caller's spoken digits imperfectly. We still store the LLM-captured
+    ``customer_phone`` on the appointment row so the historical record
+    reflects what was actually said.
+    """
     async with _async_lock:
         return await asyncio.to_thread(
             _book_appointment_sync,
             customer_name, customer_phone, stylist, service, date_iso, time_str,
-            session_id,
+            session_id, caller_phone,
         )
 
 
@@ -454,6 +539,7 @@ def _book_appointment_sync(
     date_iso: str,
     time_str: str,
     session_id: str | None = None,
+    caller_phone: str | None = None,
 ) -> dict:
     try:
         d = _parse_date(date_iso)
@@ -525,6 +611,44 @@ def _book_appointment_sync(
                 if _overlaps(start, end, a.start_time, a.end_time):
                     return {"error": f"{stylist_obj.name} is already booked at {time_str}."}
 
+            # Ensure a Clients row exists for this caller. Prefer the
+            # Twilio-provided caller_phone (ground truth) over what the
+            # LLM captured. Same transaction as the appointment insert,
+            # so a failed appointment doesn't strand a client row.
+            client_phone_normalized = normalize_phone(caller_phone or customer_phone)
+            client_id: int | None = None
+            if client_phone_normalized:
+                client_row = sess.scalar(
+                    select(ClientRow).where(ClientRow.phone == client_phone_normalized)
+                )
+                first_name = ""
+                last_name = ""
+                if customer_name:
+                    parts = customer_name.strip().split(maxsplit=1)
+                    first_name = parts[0] if parts else ""
+                    last_name = parts[1] if len(parts) > 1 else ""
+
+                now = datetime.now()
+                if client_row is None:
+                    client_row = ClientRow(
+                        first_name=first_name,
+                        last_name=last_name,
+                        phone=client_phone_normalized,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    sess.add(client_row)
+                    sess.flush()
+                else:
+                    # Never overwrite existing names — admin edits win.
+                    if first_name and not client_row.first_name:
+                        client_row.first_name = first_name
+                        client_row.updated_at = now
+                    if last_name and not client_row.last_name:
+                        client_row.last_name = last_name
+                        client_row.updated_at = now
+                client_id = client_row.id
+
             appt_id = uuid.uuid4().hex[:8]
             sess.add(Appointment(
                 id=appt_id,
@@ -533,6 +657,7 @@ def _book_appointment_sync(
                 customer_phone=customer_phone,
                 staff_id=staff_row.id,
                 service_id=svc_row.id,
+                client_id=client_id,
                 date=d,
                 start_time=start,
                 end_time=end,
@@ -1295,6 +1420,7 @@ __all__ = [
     "normalize_phone",
     "format_phone",
     "system_prompt_context",
+    "caller_context",
     "check_availability",
     "book_appointment",
     "list_staff",
