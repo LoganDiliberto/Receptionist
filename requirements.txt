@@ -7,6 +7,15 @@ fastapi==0.136.3
 uvicorn[standard]==0.49.0
 python-dotenv==1.2.2
 loguru==0.7.3
+
+# Database. SQLAlchemy uses sync sessions; async bot tools wrap them in
+# asyncio.to_thread. SQLite ships with Python — no extra driver needed.
+SQLAlchemy==2.0.36
+alembic==1.14.0
+
+# openpyxl is now only used by the one-shot xlsx import/export CLIs,
+# not by the running server. Kept in the runtime image so `python -m
+# import_xlsx <file>` works via `fly ssh console`.
 openpyxl==3.1.5
 
 # Pipecat + the exact set of provider extras we use in bot.py.

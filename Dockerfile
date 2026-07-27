@@ -45,8 +45,14 @@ RUN mkdir -p /app/voices \
        download_voice('${PIPER_VOICE}', Path('/app/voices'))"
 
 # App source (order matters for cache: most-frequently-changed files last).
-COPY salon.py admin_api.py calls.py bot.py server.py entrypoint.sh ./
+COPY salon.py db.py models.py admin_api.py calls.py bot.py server.py entrypoint.sh ./
+COPY import_xlsx.py export_xlsx.py ./
+COPY alembic.ini ./
+COPY alembic/ ./alembic/
 COPY static/ ./static/
+# Legacy seed workbook, only used by entrypoint.sh on very first boot of a
+# fresh volume when neither the DB nor a legacy /data/ReceptionistData.xlsx
+# exist. Once the DB is populated the seed is never touched again.
 COPY ReceptionistData.xlsx ./ReceptionistData.xlsx.seed
 
 # Built Angular assets — the FastAPI server serves them from this exact path.
@@ -58,6 +64,7 @@ RUN chmod +x /app/entrypoint.sh \
 # Fly.io defaults to $PORT=8080, but our server also honors $PORT — no hardcoded value.
 ENV HOST=0.0.0.0 \
     PORT=8080 \
+    SALON_DB_PATH=/data/receptionist.db \
     SALON_DATA_PATH=/data/ReceptionistData.xlsx \
     PYTHONUNBUFFERED=1
 
