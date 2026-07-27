@@ -1,13 +1,15 @@
 """SQLAlchemy models for the salon data store.
 
-The schema mirrors what the xlsx workbook expressed via sheets:
+The schema mirrors what the xlsx workbook expressed via sheets, plus a
+``Client`` table added in Phase 2:
 
   Location sheet   -> Salon (single row)
   Hours sheet      -> Hours (one row per weekday)
   Services sheet   -> Service
   Associates sheet -> Staff + StaffService (many-to-many)
   Schedule sheet   -> StaffHours (one row per staff × weekday)
-  Appointments     -> Appointment
+  Appointments     -> Appointment  (now with optional client_id FK)
+  (new)            -> Client       (people we've talked to before)
 
 Design notes:
 
@@ -22,6 +24,9 @@ Design notes:
   silently orphaned them, which was a latent bug).
 - All weekday strings use the canonical Sunday..Saturday form defined in
   ``salon.WEEKDAYS`` — no enum needed since SQLite doesn't enforce them.
+- Client.phone stores the *normalized* form (US: last 10 digits). Lookups
+  and uniqueness both operate on that form; the raw E.164 the caller
+  actually dialed lives in Appointment.customer_phone.
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Time,
@@ -136,12 +142,50 @@ class StaffHours(Base):
     staff: Mapped[Staff] = relationship(Staff, back_populates="hours")
 
 
+class Client(Base):
+    """A person we've talked to before.
+
+    ``phone`` is the normalized form (see ``salon.normalize_phone``): US
+    numbers reduce to their last 10 digits. Uniqueness is enforced at the
+    DB level so we can't accidentally create two rows for the same
+    caller.
+
+    ``customer_name`` on old appointments continues to hold whatever the
+    LLM captured. Once ``client_id`` is populated the client's first/last
+    name is the source of truth; the appointment's ``customer_name`` is
+    just a historical snapshot of what was said on the call.
+    """
+
+    __tablename__ = "clients"
+    __table_args__ = (Index("ix_clients_phone", "phone", unique=True),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    first_name: Mapped[str] = mapped_column(String, nullable=False, default="")
+    last_name: Mapped[str] = mapped_column(String, nullable=False, default="")
+    phone: Mapped[str] = mapped_column(String, nullable=False)
+    email: Mapped[str | None] = mapped_column(String, nullable=True)
+    gender: Mapped[str | None] = mapped_column(String, nullable=True)
+    notes: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    appointments: Mapped[list["Appointment"]] = relationship(
+        "Appointment",
+        back_populates="client",
+        # SET NULL preserves history if a client row is ever deleted —
+        # the appointment survives with customer_name / customer_phone
+        # intact but detached from any client record.
+        passive_deletes=True,
+    )
+
+
 class Appointment(Base):
     """A booked appointment.
 
-    ``customer_name`` and ``customer_phone`` are stored inline for now.
-    Phase 2 adds a nullable ``client_id`` FK and starts populating it;
-    a follow-up migration will make the phone/name columns derived.
+    ``customer_name`` and ``customer_phone`` are stored inline as a
+    historical snapshot of what the caller (or admin) actually said.
+    ``client_id`` links to the canonical Client row when we recognized
+    the caller by phone number, or when an admin manually attached one.
     """
 
     __tablename__ = "appointments"
@@ -156,6 +200,9 @@ class Appointment(Base):
     service_id: Mapped[int] = mapped_column(
         ForeignKey("services.id", ondelete="RESTRICT"), nullable=False
     )
+    client_id: Mapped[int | None] = mapped_column(
+        ForeignKey("clients.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
     date: Mapped[date] = mapped_column(Date, nullable=False)
     start_time: Mapped[time] = mapped_column(Time, nullable=False)
     end_time: Mapped[time] = mapped_column(Time, nullable=False)
@@ -163,3 +210,6 @@ class Appointment(Base):
 
     staff: Mapped[Staff] = relationship(Staff, lazy="joined")
     service: Mapped[Service] = relationship(Service, lazy="joined")
+    client: Mapped[Client | None] = relationship(
+        Client, back_populates="appointments", lazy="joined",
+    )

@@ -28,12 +28,22 @@ from sqlalchemy import delete, select
 from db import session_scope
 from models import (
     Appointment,
+    Client as ClientRow,
     Hours as HoursRow,
     Salon as SalonRow,
     Service as ServiceRow,
     Staff as StaffRow,
     StaffHours as StaffHoursRow,
 )
+
+
+def _normalize_phone(raw: str | None) -> str:
+    """Match salon.normalize_phone. Kept local to avoid the salon import
+    from firing (it eagerly loads INFO, which is wasted work during import)."""
+    if not raw:
+        return ""
+    digits = re.sub(r"\D", "", raw)
+    return digits[-10:] if len(digits) >= 10 else ""
 
 
 WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday",
@@ -191,6 +201,29 @@ def _load_appointments(wb) -> list[dict]:
     return out
 
 
+def _load_clients(wb) -> list[dict]:
+    """Parse the (Phase-2 addition) Clients sheet. Missing sheet is fine —
+    older workbooks pre-date the clients feature; they just import
+    zero clients."""
+    if "Clients" not in wb.sheetnames:
+        return []
+    rows = list(wb["Clients"].iter_rows(values_only=True))
+    if len(rows) < 2:
+        return []
+    header = [str(c).strip() if c is not None else "" for c in rows[0]]
+    out: list[dict] = []
+    for row in rows[1:]:
+        if not row or all(c is None for c in row):
+            continue
+        rec = dict(zip(header, row))
+        # phone is required — skip rows without one so we don't hit the
+        # NOT NULL constraint mid-import.
+        if not rec.get("phone"):
+            continue
+        out.append(rec)
+    return out
+
+
 # ---------- Table-level ops ----------
 
 
@@ -215,6 +248,7 @@ def _wipe(sess) -> None:
     sess.execute(delete(ServiceRow))
     sess.execute(delete(HoursRow))
     sess.execute(delete(SalonRow))
+    sess.execute(delete(ClientRow))
 
 
 # ---------- Main import ----------
@@ -232,11 +266,12 @@ def import_workbook(path: Path, *, wipe: bool = False, force: bool = False) -> N
     services = _load_services(wb)
     staff = _load_staff(wb)
     appointments = _load_appointments(wb)
+    clients = _load_clients(wb)
 
     logger.info(
         f"Parsed: location={bool(location)}, hours={sum(1 for h in hours.values() if h)}"
         f", services={len(services)}, staff={len(staff)}"
-        f", appointments={len(appointments)}"
+        f", clients={len(clients)}, appointments={len(appointments)}"
     )
 
     with session_scope() as sess:
@@ -311,6 +346,64 @@ def import_workbook(path: Path, *, wipe: bool = False, force: bool = False) -> N
                 row.hours.append(StaffHoursRow(weekday=day, start=start, end=end))
         sess.flush()
 
+        # Clients — upsert by normalized phone. Skipping any legacy rows
+        # missing phone happens earlier in _load_clients.
+        client_by_phone: dict[str, ClientRow] = {}
+        for rec in clients:
+            phone = _normalize_phone(str(rec.get("phone") or ""))
+            if not phone:
+                logger.warning(
+                    f"Skipping client row with unusable phone {rec.get('phone')!r}"
+                )
+                continue
+            existing_client = sess.scalar(select(ClientRow).where(ClientRow.phone == phone))
+            first = str(rec.get("first_name") or "").strip()
+            last = str(rec.get("last_name") or "").strip()
+            email = (str(rec["email"]).strip() or None) if rec.get("email") else None
+            gender = (str(rec["gender"]).strip() or None) if rec.get("gender") else None
+            notes = (str(rec["notes"]).strip() or None) if rec.get("notes") else None
+
+            def _dt(raw) -> datetime:
+                if isinstance(raw, datetime):
+                    return raw
+                if raw:
+                    try:
+                        return datetime.fromisoformat(str(raw))
+                    except ValueError:
+                        pass
+                return datetime.now()
+
+            created_at = _dt(rec.get("created_at"))
+            updated_at = _dt(rec.get("updated_at")) if rec.get("updated_at") else created_at
+
+            if existing_client is None:
+                existing_client = ClientRow(
+                    first_name=first,
+                    last_name=last,
+                    phone=phone,
+                    email=email,
+                    gender=gender,
+                    notes=notes,
+                    created_at=created_at,
+                    updated_at=updated_at,
+                )
+                sess.add(existing_client)
+            else:
+                existing_client.first_name = first or existing_client.first_name
+                existing_client.last_name = last or existing_client.last_name
+                existing_client.email = email or existing_client.email
+                existing_client.gender = gender or existing_client.gender
+                existing_client.notes = notes or existing_client.notes
+                existing_client.updated_at = updated_at
+            client_by_phone[phone] = existing_client
+        sess.flush()
+
+        # Make sure any existing client rows (from --force) are indexed too,
+        # so appointments can still link if the xlsx only carries phone
+        # numbers on Appointment rows.
+        for row in sess.scalars(select(ClientRow)):
+            client_by_phone.setdefault(row.phone, row)
+
         # Appointments — insert by original id, skip any we already have
         # (matters if the caller passed --force on a non-empty DB).
         staff_by_name_lc = {
@@ -345,13 +438,22 @@ def import_workbook(path: Path, *, wipe: bool = False, force: bool = False) -> N
                     )
                     continue
 
+                # Link this appointment to a Client row if we can find one
+                # by phone. This is the retroactive-linking hook: legacy
+                # workbooks without a Clients sheet still hydrate the FK
+                # from the phone column that's always been there.
+                customer_phone_raw = str(rec.get("customer_phone") or "").strip()
+                normalized = _normalize_phone(customer_phone_raw)
+                client_row = client_by_phone.get(normalized) if normalized else None
+
                 appt = Appointment(
                     id=appt_id,
                     created_at=created_at,
                     customer_name=str(rec.get("customer_name") or "").strip(),
-                    customer_phone=str(rec.get("customer_phone") or "").strip(),
+                    customer_phone=customer_phone_raw,
                     staff_id=staff_row.id,
                     service_id=svc_row.id,
+                    client_id=client_row.id if client_row else None,
                     date=_coerce_date(rec.get("date")),
                     start_time=_coerce_time(rec.get("start_time")),
                     end_time=_coerce_time(rec.get("end_time")),

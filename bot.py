@@ -72,8 +72,10 @@ class TranscriptLogger(FrameProcessor):
         logger.bind(transcript=True, session=self._session_id, role=self._role).info(text)
 
 
-def _build_system_prompt() -> str:
-    """Salon-aware system prompt. Built fresh each call so today's date is current."""
+def _build_system_prompt(caller_phone: str | None) -> str:
+    """Salon-aware system prompt. Built fresh each call so today's date is
+    current and the caller-info block reflects who is on the line right now.
+    """
     today = date.today()
     weekday = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][
         today.weekday()
@@ -94,6 +96,18 @@ Behavior:
 - Help callers with three things: salon info, checking availability, and booking.
 - If you don't know something, say so and offer to take a message.
 
+Caller-specific behavior:
+- If CALLER INFO below says the caller is on file, greet them by their
+  first name once you know why they're calling, and DO NOT ask for their
+  name or callback phone number — you already have both.
+- DO NOT ask for a callback phone number for any caller. The number in
+  CALLER INFO is the one to use — pass it as customer_phone when booking.
+  The only exception is if the caller explicitly asks you to use a
+  different number.
+- If a returning caller says "my appointment" without naming which one
+  and CALLER INFO shows exactly one upcoming appointment, assume that's
+  the one they mean. If there are multiple, ask which.
+
 Tool-use rules — these are MANDATORY:
 1. NEVER claim a slot is taken, free, or that a stylist is "booked until X"
    from your own reasoning. You don't know — only the tool does. The instant
@@ -106,6 +120,8 @@ Tool-use rules — these are MANDATORY:
    returns ok=true, the booking succeeded; if it returns an error, say so.
 3. For static info (hours, services, which stylist offers what, weekly
    schedule) answer from the data block below — no tool call needed.
+
+{salon.caller_context(caller_phone)}
 
 {salon.system_prompt_context()}
 """
@@ -168,12 +184,14 @@ def _build_tools_schema() -> ToolsSchema:
     ])
 
 
-def _make_tool_handlers(session_id: str):
-    """Build tool handlers that close over the current session id.
+def _make_tool_handlers(session_id: str, caller_phone: str | None):
+    """Build tool handlers that close over the current session id and caller.
 
-    Defining these inside `run_bot` (via this factory) gives us a clean way
-    to attach the per-call session id to every appointment the LLM books —
-    without having to thread it through the LLM's own arguments.
+    Defining these inside ``run_bot`` (via this factory) gives us a clean
+    way to attach the per-call session id + caller phone to every
+    appointment the LLM books — without having to thread them through
+    the LLM's own arguments (the LLM shouldn't have to think about
+    ``client_id`` or session bookkeeping).
     """
 
     async def check_availability(params: FunctionCallParams) -> None:
@@ -198,6 +216,7 @@ def _make_tool_handlers(session_id: str):
             date_iso=args["date_iso"],
             time_str=args["time_str"],
             session_id=session_id,
+            caller_phone=caller_phone,
         )
         logger.bind(session=session_id).info(
             f"book_appointment({args}) -> {result}"
@@ -207,16 +226,28 @@ def _make_tool_handlers(session_id: str):
     return check_availability, book_appointment
 
 
-async def run_bot(transport: BaseTransport, *, sample_rate: int) -> None:
+async def run_bot(
+    transport: BaseTransport,
+    *,
+    sample_rate: int,
+    caller_phone: str | None = None,
+) -> None:
     """Build and run the voice pipeline against an already-connected transport.
 
     Args:
         transport: A constructed Pipecat transport (WebRTC, Twilio WS, etc).
         sample_rate: Wire sample rate (e.g. 16000 for WebRTC, 8000 for Twilio
             Media Streams). Services resample internally as needed.
+        caller_phone: Caller's phone number (E.164 or any format), extracted
+            from the Twilio ``From`` field on inbound calls. ``None`` for the
+            browser test transport, where there is no phone number.
     """
     session_id = uuid.uuid4().hex[:8]
-    logger.info(f"Starting session {session_id} @ {sample_rate} Hz")
+    normalized_caller = salon.normalize_phone(caller_phone) if caller_phone else None
+    logger.info(
+        f"Starting session {session_id} @ {sample_rate} Hz"
+        + (f" (caller={salon.format_phone(normalized_caller)})" if normalized_caller else "")
+    )
 
     # VAD tuning: defaults (stop_secs=0.2) end the turn after just 200ms of
     # silence, which clips natural mid-sentence pauses on a phone call. 0.8s
@@ -251,7 +282,9 @@ async def run_bot(transport: BaseTransport, *, sample_rate: int) -> None:
     llm = OpenAILLMService(
         settings=OpenAILLMService.Settings(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
     )
-    check_availability_tool, book_appointment_tool = _make_tool_handlers(session_id)
+    check_availability_tool, book_appointment_tool = _make_tool_handlers(
+        session_id, caller_phone=normalized_caller,
+    )
     llm.register_function("check_availability", check_availability_tool)
     llm.register_function("book_appointment", book_appointment_tool)
 
@@ -262,7 +295,7 @@ async def run_bot(transport: BaseTransport, *, sample_rate: int) -> None:
     )
 
     context = LLMContext(
-        messages=[{"role": "system", "content": _build_system_prompt()}],
+        messages=[{"role": "system", "content": _build_system_prompt(normalized_caller)}],
         tools=_build_tools_schema(),
     )
     aggregators = LLMContextAggregatorPair(context)

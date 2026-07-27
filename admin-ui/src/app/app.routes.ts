@@ -21,6 +21,12 @@ export const APP_ROUTES: Routes = [
     title: 'Services',
   },
   {
+    path: 'clients',
+    loadComponent: () =>
+      import('./pages/clients.component').then((m) => m.ClientsComponent),
+    title: 'Clients',
+  },
+  {
     path: 'calendar',
     loadComponent: () =>
       import('./pages/calendar.component').then((m) => m.CalendarComponent),

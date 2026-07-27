@@ -203,28 +203,56 @@ async def offer_patch(request: SmallWebRTCPatchRequest) -> dict:
 @app.post("/voice")
 async def twilio_voice_webhook(request: Request) -> Response:
     """Twilio hits this when a call comes in. We return TwiML telling Twilio
-    to bidirectionally stream the call audio to our WebSocket endpoint."""
+    to bidirectionally stream the call audio to our WebSocket endpoint.
+
+    Twilio's webhook body includes ``From=+1XXXXXXXXXX`` — the caller's
+    phone number. We forward it into the Media Stream via a
+    ``<Parameter>`` tag so the bot can look up the caller in the
+    Clients table and personalize its greeting.
+    """
 
     # The wss URL needs to be the public-facing host (ngrok in dev). Trust
     # X-Forwarded-Host if present so ngrok works without configuration.
     host = request.headers.get("x-forwarded-host") or request.url.netloc
     ws_url = f"wss://{host}/twilio/ws"
 
+    # Twilio posts as application/x-www-form-urlencoded. Fall back to
+    # empty string so a bogus request without a From field doesn't blow
+    # up the whole webhook.
+    form = await request.form()
+    caller_from = str(form.get("From") or "").strip()
+
+    # Only emit the <Parameter> tag when we actually have a value —
+    # missing tags are cleaner than empty ones and safer if Twilio ever
+    # tightens its TwiML validation. XML-escape the value just in case.
+    param_line = ""
+    if caller_from:
+        escaped = (
+            caller_from.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+        param_line = f'\n      <Parameter name="from" value="{escaped}" />'
+
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="{ws_url}" />
+    <Stream url="{ws_url}">{param_line}
+    </Stream>
   </Connect>
 </Response>"""
-    logger.info(f"TwiML response — streaming to {ws_url}")
+    logger.info(
+        f"TwiML response — streaming to {ws_url}"
+        + (f" (From={caller_from})" if caller_from else " (no From field)")
+    )
     return Response(content=twiml, media_type="application/xml")
 
 
 @app.websocket("/twilio/ws")
 async def twilio_media_stream(websocket: WebSocket) -> None:
     """One Twilio Media Stream per call. Twilio sends 'connected' then 'start'
-    before any media — we parse the start frame for the stream/call SIDs, then
-    hand the live socket to the bot pipeline."""
+    before any media — we parse the start frame for the stream/call SIDs and
+    the caller's phone (forwarded via <Parameter name="from"> in the TwiML),
+    then hand the live socket to the bot pipeline."""
 
     await websocket.accept()
     logger.info("Twilio WS accepted")
@@ -232,13 +260,23 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
     # Read until we get the 'start' event (skips the initial 'connected' event).
     stream_sid: str | None = None
     call_sid: str | None = None
+    caller_phone: str | None = None
     while stream_sid is None:
         raw = await websocket.receive_text()
         msg = json.loads(raw)
         if msg.get("event") == "start":
-            stream_sid = msg["start"]["streamSid"]
-            call_sid = msg["start"].get("callSid")
-            logger.info(f"Twilio stream started: stream={stream_sid} call={call_sid}")
+            start = msg["start"]
+            stream_sid = start["streamSid"]
+            call_sid = start.get("callSid")
+            # customParameters carries whatever we put in <Parameter> tags
+            # inside <Stream>. See /voice above. Twilio flattens them into
+            # a dict keyed by the tag's name attribute.
+            custom = start.get("customParameters") or {}
+            caller_phone = (custom.get("from") or "").strip() or None
+            logger.info(
+                f"Twilio stream started: stream={stream_sid} call={call_sid}"
+                + (f" from={caller_phone}" if caller_phone else "")
+            )
 
     serializer = TwilioFrameSerializer(
         stream_sid=stream_sid,
@@ -259,7 +297,7 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
         ),
     )
 
-    await _safe_run_bot(transport, TWILIO_SAMPLE_RATE)
+    await _safe_run_bot(transport, TWILIO_SAMPLE_RATE, caller_phone=caller_phone)
 
 
 # ---------- Shared ----------
@@ -270,9 +308,14 @@ async def _shutdown() -> None:
     await webrtc_handler.close()
 
 
-async def _safe_run_bot(transport: BaseTransport, sample_rate: int) -> None:
+async def _safe_run_bot(
+    transport: BaseTransport,
+    sample_rate: int,
+    *,
+    caller_phone: str | None = None,
+) -> None:
     try:
-        await run_bot(transport, sample_rate=sample_rate)
+        await run_bot(transport, sample_rate=sample_rate, caller_phone=caller_phone)
     except asyncio.CancelledError:
         raise
     except Exception:

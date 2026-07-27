@@ -64,6 +64,17 @@ import { ApiService, Summary } from '../api.service';
             </mat-card-content>
           </mat-card>
 
+          <mat-card class="tile" routerLink="/clients">
+            <mat-card-content>
+              <div class="tile-header">
+                <mat-icon>contacts</mat-icon>
+                <span class="tile-label">Clients</span>
+              </div>
+              <div class="tile-value">{{ s.client_count }}</div>
+              <div class="tile-sub">On file</div>
+            </mat-card-content>
+          </mat-card>
+
           <mat-card class="tile" routerLink="/calls">
             <mat-card-content>
               <div class="tile-header">

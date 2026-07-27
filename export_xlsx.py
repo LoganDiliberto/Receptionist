@@ -23,6 +23,7 @@ from sqlalchemy.orm import selectinload
 from db import session_scope
 from models import (
     Appointment,
+    Client as ClientRow,
     Hours as HoursRow,
     Salon as SalonRow,
     Service as ServiceRow,
@@ -117,12 +118,34 @@ def export_workbook(path: Path) -> None:
                 row.append(_fmt_range(*slot) if slot else None)
             ws.append(row)
 
+        # Clients (Phase 2). Emitted before Appointments so the row order
+        # in the workbook matches the FK dependency order — makes manual
+        # inspection easier for anyone reading the file top to bottom.
+        ws = wb.create_sheet("Clients")
+        client_columns = [
+            "id", "first_name", "last_name", "phone", "email",
+            "gender", "notes", "created_at", "updated_at",
+        ]
+        ws.append(client_columns)
+        for c in sess.scalars(select(ClientRow).order_by(ClientRow.id)):
+            ws.append([
+                c.id,
+                c.first_name,
+                c.last_name,
+                c.phone,
+                c.email,
+                c.gender,
+                c.notes,
+                c.created_at.isoformat(timespec="seconds"),
+                c.updated_at.isoformat(timespec="seconds"),
+            ])
+
         # Appointments
         ws = wb.create_sheet("Appointments")
         columns = [
             "id", "created_at", "customer_name", "customer_phone",
             "stylist", "service", "date", "start_time", "end_time",
-            "session_id",
+            "session_id", "client_id",
         ]
         ws.append(columns)
         appt_stmt = (
@@ -142,6 +165,7 @@ def export_workbook(path: Path) -> None:
                 a.start_time.strftime("%H:%M"),
                 a.end_time.strftime("%H:%M"),
                 a.session_id,
+                a.client_id,
             ])
 
     path.parent.mkdir(parents=True, exist_ok=True)

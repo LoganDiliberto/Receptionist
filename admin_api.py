@@ -62,6 +62,15 @@ class AppointmentPayload(BaseModel):
     end_time: str | None = None
 
 
+class ClientPayload(BaseModel):
+    first_name: str = ""
+    last_name: str = ""
+    phone: str
+    email: str | None = None
+    gender: str | None = None
+    notes: str | None = None
+
+
 # ---------- Helpers ----------
 
 
@@ -89,6 +98,7 @@ async def summary() -> dict:
         "staff_count": len(salon.INFO.stylists),
         "service_count": len(salon.INFO.services),
         "appointment_count": len(await _run(salon.list_appointments)),
+        "client_count": len(await _run(salon.list_clients)),
         "call_count": len(await _run(calls.list_calls)),
     }
 
@@ -246,6 +256,73 @@ async def edit_appointment(appt_id: str, payload: AppointmentPayload) -> dict:
 async def remove_appointment(appt_id: str) -> dict:
     try:
         await _run(salon.delete_appointment, appt_id)
+    except KeyError as e:
+        raise _not_found(e)
+    return {"ok": True}
+
+
+# ---------- Clients (Phase 3) ----------
+
+
+@router.get("/clients")
+async def get_clients(q: str | None = Query(default=None)) -> list[dict]:
+    return await _run(salon.list_clients, q)
+
+
+@router.get("/clients/{client_id}")
+async def get_client(client_id: int) -> dict:
+    client = await _run(salon.get_client, client_id)
+    if client is None:
+        raise HTTPException(status_code=404, detail=f"Client {client_id!r} not found.")
+    return client
+
+
+@router.get("/clients/{client_id}/appointments")
+async def get_client_appointments(
+    client_id: int,
+    upcoming_only: bool = Query(default=False),
+) -> list[dict]:
+    """Full appointment history for one client, most recent first."""
+    if await _run(salon.get_client, client_id) is None:
+        raise HTTPException(status_code=404, detail=f"Client {client_id!r} not found.")
+    return await _run(salon.client_history, client_id, upcoming_only=upcoming_only)
+
+
+@router.get("/clients/by-phone/{phone}")
+async def lookup_client_by_phone(phone: str) -> dict:
+    """Convenience lookup used by the appointment editor to auto-suggest a
+    client when the admin types a phone number."""
+    client = await _run(salon.get_client_by_phone, phone)
+    if client is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No client on file for phone {phone!r}.",
+        )
+    return client
+
+
+@router.post("/clients")
+async def add_client(payload: ClientPayload) -> dict:
+    try:
+        return await _run(salon.create_client, payload.model_dump())
+    except ValueError as e:
+        raise _client_error(e)
+
+
+@router.put("/clients/{client_id}")
+async def edit_client(client_id: int, payload: ClientPayload) -> dict:
+    try:
+        return await _run(salon.update_client, client_id, payload.model_dump())
+    except KeyError as e:
+        raise _not_found(e)
+    except ValueError as e:
+        raise _client_error(e)
+
+
+@router.delete("/clients/{client_id}")
+async def remove_client(client_id: int) -> dict:
+    try:
+        await _run(salon.delete_client, client_id)
     except KeyError as e:
         raise _not_found(e)
     return {"ok": True}

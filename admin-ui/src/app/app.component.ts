@@ -43,6 +43,10 @@ import { MatListModule } from '@angular/material/list';
             <mat-icon matListItemIcon>content_cut</mat-icon>
             <span matListItemTitle>Services</span>
           </a>
+          <a mat-list-item routerLink="/clients" routerLinkActive="active-link">
+            <mat-icon matListItemIcon>contacts</mat-icon>
+            <span matListItemTitle>Clients</span>
+          </a>
           <a mat-list-item routerLink="/calendar" routerLinkActive="active-link">
             <mat-icon matListItemIcon>event</mat-icon>
             <span matListItemTitle>Calendar</span>
