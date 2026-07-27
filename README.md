@@ -81,10 +81,15 @@ instead of a phone, so you can test changes without making a phone call.
 |---|---|
 | `server.py` | The web server. Accepts incoming calls (from the browser or from Twilio), sets up a transport for each call, and starts a bot to run the conversation. Also serves the admin UI and its REST API. |
 | `run.py` | Convenience launcher: spawns `server.py` and `ngrok http 7860` together and prints the public URL you paste into Twilio. Also `run.cmd` for a shorter double-click / one-word invocation on Windows. |
-| `bot.py` | Defines the voice pipeline — the chain of components that turn caller audio into a reply. Transport-agnostic, so the same bot works for browser tests and real phone calls. |
-| `salon.py` | The salon data layer. Reads and writes `ReceptionistData.xlsx` (hours, staff, services, schedules, appointments) and exposes the two async tools (`check_availability`, `book_appointment`) the LLM calls, plus CRUD helpers used by the admin API. |
+| `bot.py` | Defines the voice pipeline — the chain of components that turn caller audio into a reply. Transport-agnostic, so the same bot works for browser tests and real phone calls. When a caller's phone number is known, `bot.py` injects their name and appointment history into the system prompt so the LLM greets returning callers by name. |
+| `salon.py` | The salon data layer. Reads and writes the SQLite database (hours, staff, services, schedules, appointments, **clients**) via SQLAlchemy and exposes the async tools (`check_availability`, `book_appointment`) the LLM calls, plus CRUD helpers used by the admin API. Includes `normalize_phone` / `format_phone` and the `caller_context()` block that gets injected into the bot's system prompt on each call. |
+| `models.py` | SQLAlchemy ORM models: `Salon`, `Hours`, `Service`, `Staff`, `StaffHours`, `Appointment`, and `Client`. Appointments carry a nullable `client_id` FK to `Client`. |
+| `db.py` | SQLAlchemy engine + `session_scope` context manager. Reads the DB URL from `DATABASE_URL` (Postgres, if you ever add it) or falls back to a SQLite file at `SALON_DB_PATH`. |
+| `alembic/` | Schema migrations. `alembic upgrade head` runs automatically on every container boot (see `entrypoint.sh`). |
+| `import_xlsx.py` / `export_xlsx.py` | One-shot CLIs to move data between the legacy `ReceptionistData.xlsx` and the SQLite database. Only used for onboarding a new salon or debugging — the running server touches only the DB. |
+| `backfill_clients.py` | Post-Phase-2 one-shot: creates `Client` rows for each unique `Appointment.customer_phone` in the DB and links appointments to them. Idempotent — safe to re-run. Dry-run by default; pass `--commit` to write. |
 | `calls.py` | Parses `logs/transcripts.log` into structured call records and links each call to the appointment it produced (via the `session_id` column). |
-| `admin_api.py` | FastAPI router mounted at `/api` that exposes staff/services/hours/appointments/calls to the admin UI. |
+| `admin_api.py` | FastAPI router mounted at `/api` that exposes staff/services/hours/appointments/**clients**/calls to the admin UI. |
 | `admin-ui/` | Angular admin console (built with `npm run build`; served by FastAPI at `/admin`). |
 | `static/index.html` | A small webpage that lets you "call" the bot from your browser for testing. |
 | `voices/` | The Piper text-to-speech voice files. Not committed (see `.gitignore`) — Piper auto-downloads the voice named by `PIPER_VOICE` on first synthesis, and the Docker build pre-bakes it so the first call has no download latency. |
@@ -204,15 +209,24 @@ in `server.py`.
 
 ### What the pages do
 
-- **Dashboard** — quick counts of staff, services, and appointments plus the
-  salon's location.
+- **Dashboard** — quick counts of staff, services, appointments, clients,
+  and calls, plus the salon's location.
 - **Staff** — add, edit, or remove staff members; pick which services they
   offer and set their weekly schedule.
 - **Services** — add, edit, or remove services and their duration and price.
-  Services live in a `Services` sheet created automatically on first boot.
+- **Clients** — the salon's address book. Search by name or phone;
+  create/edit/delete clients; view each client's upcoming and past
+  appointments in one place. Clients are populated automatically the
+  first time someone books over the phone — the bot upserts the caller
+  into this table using Twilio's `From` number as the primary key, so
+  the second call greets them by name. You can also add walk-ins
+  manually. Deleting a client detaches (but preserves) their historical
+  appointments.
 - **Calendar** — a week-at-a-glance grid of upcoming appointments. Click any
   day to add a new booking, or click an existing appointment to edit or
   cancel it. Uses the same conflict-detection logic the voice bot does.
+  When an appointment is linked to a client, the editor shows a
+  "Linked to client" badge below the phone field.
 - **Calls** — an observability view of every call the bot has answered.
   Each row shows when the call happened, how long it lasted, how many turns
   it took, and whether it resulted in a booking. Click a row for the full
@@ -424,7 +438,8 @@ Something went wrong on a phone call. In order, check:
 | Tail production logs | `fly logs -a salon-poc` |
 | Open a shell in the running container | `fly ssh console -a salon-poc` |
 | Roll back to the previous release | `fly releases -a salon-poc` then `fly deploy --image <previous-image-ref>` |
-| Download the live salon workbook | `fly ssh sftp get /data/ReceptionistData.xlsx` |
+| Export a spreadsheet backup of the live DB | `fly ssh console -a salon-poc -C "python -m export_xlsx /data/backup.xlsx"` then `fly ssh sftp get /data/backup.xlsx` |
+| Backfill clients from existing appointments (one-shot after Clients ships) | Dry run: `fly ssh console -a salon-poc -C "python -m backfill_clients"`. Write: `... -C "python -m backfill_clients --commit"` |
 | See what secrets are set (names only) | `fly secrets list -a salon-poc` |
 | Scale up to a bigger VM | `fly scale vm shared-cpu-2x --memory 2048` |
 | Restart the machine (no rebuild) | `fly apps restart salon-poc` |
@@ -432,8 +447,11 @@ Something went wrong on a phone call. In order, check:
 ### What lives where after deploy
 
 - **Code**: baked into the container image at `/app`.
-- **Salon data**: `/data/ReceptionistData.xlsx` on the `receptionist_data`
-  volume. Persists across `fly deploy`s. Edits made in the admin UI stick.
+- **Salon data**: `/data/receptionist.db` (SQLite) on the `receptionist_data`
+  volume. Persists across `fly deploy`s. Alembic migrations run on every
+  boot. Edits made in the admin UI stick. The legacy workbook, if present,
+  is one-shot imported and renamed to
+  `/data/ReceptionistData.xlsx.imported`.
 - **Piper voice**: `/app/voices/en_US-amy-medium.onnx` — pre-baked into
   the image at build time by the Dockerfile.
 - **Logs**: `/app/logs/*.log` inside the container (rotated), plus everything
@@ -458,7 +476,8 @@ Something went wrong on a phone call. In order, check:
 - **The transport is swappable.** Browser, Twilio, and other phone providers
   all plug into the same pipeline. If we ever leave Twilio for a cheaper
   provider, it's a one-file change.
-- **Data lives in Excel on a persistent volume.** Trade-off: won't scale
-  past one salon and one machine, but it *is* the file managers know how
-  to open, edit, and back up. Migrating to Postgres is a straight
-  `salon.py` refactor whenever we outgrow this.
+- **Data lives in SQLite on a persistent volume.** Trade-off: won't scale
+  past one salon and one machine, but it's simple, zero-ops, and
+  `export_xlsx` still gives you a spreadsheet backup whenever you want
+  one. Migrating to Postgres is a connection-string change whenever we
+  outgrow this.
