@@ -207,16 +207,28 @@ def _make_tool_handlers(session_id: str):
     return check_availability, book_appointment
 
 
-async def run_bot(transport: BaseTransport, *, sample_rate: int) -> None:
+async def run_bot(
+    transport: BaseTransport,
+    *,
+    sample_rate: int,
+    caller_phone: str | None = None,
+) -> None:
     """Build and run the voice pipeline against an already-connected transport.
 
     Args:
         transport: A constructed Pipecat transport (WebRTC, Twilio WS, etc).
         sample_rate: Wire sample rate (e.g. 16000 for WebRTC, 8000 for Twilio
             Media Streams). Services resample internally as needed.
+        caller_phone: Caller's phone number (E.164 or any format), extracted
+            from the Twilio ``From`` field on inbound calls. ``None`` for the
+            browser test transport, where there is no phone number.
     """
     session_id = uuid.uuid4().hex[:8]
-    logger.info(f"Starting session {session_id} @ {sample_rate} Hz")
+    normalized_caller = salon.normalize_phone(caller_phone) if caller_phone else None
+    logger.info(
+        f"Starting session {session_id} @ {sample_rate} Hz"
+        + (f" (caller={salon.format_phone(normalized_caller)})" if normalized_caller else "")
+    )
 
     # VAD tuning: defaults (stop_secs=0.2) end the turn after just 200ms of
     # silence, which clips natural mid-sentence pauses on a phone call. 0.8s
