@@ -399,6 +399,15 @@ export class CalendarComponent implements OnInit {
           <input matInput formControlName="customer_phone" required />
         </mat-form-field>
 
+        @if (data.appointment?.client; as c) {
+          <div class="client-badge">
+            <mat-icon>person</mat-icon>
+            <span>Linked to client:</span>
+            <strong>{{ c.first_name }} {{ c.last_name }}</strong>
+            <span class="muted">({{ c.phone_formatted }})</span>
+          </div>
+        }
+
         <div class="form-row">
           <mat-form-field appearance="outline">
             <mat-label>Staff member</mat-label>
@@ -469,6 +478,26 @@ export class CalendarComponent implements OnInit {
       }
       .grow {
         flex: 1 1 auto;
+      }
+      .client-badge {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 10px;
+        margin: -4px 0 4px 0;
+        background: rgba(37, 99, 235, 0.06);
+        color: #1d4ed8;
+        border-radius: 6px;
+        font-size: 13px;
+
+        mat-icon {
+          font-size: 16px;
+          width: 16px;
+          height: 16px;
+        }
+        .muted {
+          color: #6b7280;
+        }
       }
     `,
   ],

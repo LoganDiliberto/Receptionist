@@ -1,6 +1,6 @@
 import { HttpClient, HttpErrorResponse, HttpParams } from '@angular/common/http';
 import { Injectable, inject } from '@angular/core';
-import { Observable, throwError } from 'rxjs';
+import { Observable, of, throwError } from 'rxjs';
 import { catchError } from 'rxjs/operators';
 
 export interface ScheduleSlot {
@@ -37,6 +37,9 @@ export interface Appointment {
   date: string;
   start_time: string;
   end_time?: string;
+  // Phase 2 additions — appointments now optionally link to a Client.
+  client_id?: number | null;
+  client?: ClientSummary | null;
 }
 
 export interface AppointmentPayload {
@@ -49,11 +52,39 @@ export interface AppointmentPayload {
   end_time?: string;
 }
 
+export interface ClientSummary {
+  id: number;
+  first_name: string;
+  last_name: string;
+  phone: string;
+  phone_formatted: string;
+}
+
+export interface Client extends ClientSummary {
+  email: string | null;
+  gender: Gender | null;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type Gender = 'male' | 'female' | 'nonbinary' | 'unspecified';
+
+export interface ClientPayload {
+  first_name: string;
+  last_name: string;
+  phone: string;
+  email?: string | null;
+  gender?: Gender | null;
+  notes?: string | null;
+}
+
 export interface Summary {
   location: string;
   staff_count: number;
   service_count: number;
   appointment_count: number;
+  client_count: number;
   call_count: number;
 }
 
@@ -194,6 +225,54 @@ export class ApiService {
   deleteAppointment(id: string): Observable<unknown> {
     return this.http
       .delete(`${this.base}/appointments/${encodeURIComponent(id)}`)
+      .pipe(catchError(handle));
+  }
+
+  // --- Clients ---
+  listClients(query?: string): Observable<Client[]> {
+    let params = new HttpParams();
+    if (query) params = params.set('q', query);
+    return this.http
+      .get<Client[]>(`${this.base}/clients`, { params })
+      .pipe(catchError(handle));
+  }
+  getClient(id: number): Observable<Client> {
+    return this.http
+      .get<Client>(`${this.base}/clients/${id}`)
+      .pipe(catchError(handle));
+  }
+  getClientAppointments(id: number, upcomingOnly = false): Observable<Appointment[]> {
+    let params = new HttpParams();
+    if (upcomingOnly) params = params.set('upcoming_only', 'true');
+    return this.http
+      .get<Appointment[]>(`${this.base}/clients/${id}/appointments`, { params })
+      .pipe(catchError(handle));
+  }
+  getClientByPhone(phone: string): Observable<Client | null> {
+    // 404 collapses to null so callers can render "new client" affordances
+    // without an error surface. Any other error still propagates.
+    return this.http
+      .get<Client>(`${this.base}/clients/by-phone/${encodeURIComponent(phone)}`)
+      .pipe(
+        catchError((err: HttpErrorResponse) => {
+          if (err.status === 404) return of(null);
+          return handle(err);
+        }),
+      );
+  }
+  createClient(payload: ClientPayload): Observable<Client> {
+    return this.http
+      .post<Client>(`${this.base}/clients`, payload)
+      .pipe(catchError(handle));
+  }
+  updateClient(id: number, payload: ClientPayload): Observable<Client> {
+    return this.http
+      .put<Client>(`${this.base}/clients/${id}`, payload)
+      .pipe(catchError(handle));
+  }
+  deleteClient(id: number): Observable<unknown> {
+    return this.http
+      .delete(`${this.base}/clients/${id}`)
       .pipe(catchError(handle));
   }
 }
