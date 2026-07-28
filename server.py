@@ -43,6 +43,7 @@ from pipecat.transports.websocket.fastapi import (
 )
 
 from bot import run_bot
+from auth import AdminBasicAuthMiddleware, log_auth_status
 
 load_dotenv()
 
@@ -93,6 +94,7 @@ logger.add(
     level="INFO",
 )
 logger.info(f"Logging to {LOG_DIR}")
+log_auth_status()
 
 # WebRTC pipeline runs at 16 kHz (matches Whisper). Twilio Media Streams
 # are 8 kHz μ-law; the serializer handles encoding and resampling.
@@ -101,9 +103,16 @@ TWILIO_SAMPLE_RATE = 8000
 
 app = FastAPI(title="Funkle Receptionist")
 
+# Admin Basic Auth. Added BEFORE CORS so a 401 is returned without CORS
+# complication for unauthenticated probes. Protects /admin and /api only;
+# /voice, /twilio/ws, /, /offer stay public.
+app.add_middleware(AdminBasicAuthMiddleware)
+
 # The Angular dev server runs on 4200; allow it (and any localhost origin
 # during development) to talk to the API. Same-origin requests from the
 # built /admin app aren't affected by this middleware.
+# Expose Authorization so the browser can send Basic credentials from ng serve
+# if a dev interceptor attaches them.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -112,7 +121,7 @@ app.add_middleware(
     ],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "Authorization"],
 )
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

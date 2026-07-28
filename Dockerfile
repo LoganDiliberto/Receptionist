@@ -45,7 +45,7 @@ RUN mkdir -p /app/voices \
        download_voice('${PIPER_VOICE}', Path('/app/voices'))"
 
 # App source (order matters for cache: most-frequently-changed files last).
-COPY salon.py db.py models.py admin_api.py calls.py bot.py server.py entrypoint.sh ./
+COPY salon.py db.py models.py admin_api.py calls.py bot.py server.py auth.py entrypoint.sh ./
 COPY import_xlsx.py export_xlsx.py backfill_clients.py reminders.py ./
 COPY alembic.ini ./
 COPY alembic/ ./alembic/

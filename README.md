@@ -80,6 +80,7 @@ instead of a phone, so you can test changes without making a phone call.
 | File | Job |
 |---|---|
 | `server.py` | The web server. Accepts incoming calls (from the browser or from Twilio), sets up a transport for each call, and starts a bot to run the conversation. Also serves the admin UI and its REST API. |
+| `auth.py` | HTTP Basic Auth middleware that gates `/admin` and `/api` when `ADMIN_PASSWORD` is set. Voice (`/voice`, `/twilio/ws`) and the browser test client stay public. |
 | `run.py` | Convenience launcher: spawns `server.py` and `ngrok http 7860` together and prints the public URL you paste into Twilio. Also `run.cmd` for a shorter double-click / one-word invocation on Windows. |
 | `bot.py` | Defines the voice pipeline — the chain of components that turn caller audio into a reply. Transport-agnostic, so the same bot works for browser tests and real phone calls. When a caller's phone number is known, `bot.py` injects their name and appointment history into the system prompt so the LLM greets returning callers by name. |
 | `salon.py` | The salon data layer. Reads and writes the SQLite database (hours, staff, services, schedules, appointments, **clients**) via SQLAlchemy and exposes the async tools (`check_availability`, `book_appointment`) the LLM calls, plus CRUD helpers used by the admin API. Includes `normalize_phone` / `format_phone` and the `caller_context()` block that gets injected into the bot's system prompt on each call. |
@@ -207,6 +208,12 @@ npm start
 Then open `http://127.0.0.1:4200/`. The dev server proxies API calls to the
 FastAPI server on port 7860; CORS for `localhost:4200` is already configured
 in `server.py`.
+
+If you set `ADMIN_PASSWORD` locally, the Angular dev server on `:4200` will
+get `401`s from `/api` (browsers don't auto-attach Basic Auth across
+origins). Easiest options: leave `ADMIN_PASSWORD` unset while using
+`ng serve`, or open the built app at `http://127.0.0.1:7860/admin` instead
+(same origin — the browser login dialog works).
 
 ### What the pages do
 
@@ -338,12 +345,19 @@ fly secrets set \
   DEEPGRAM_API_KEY=... \
   TWILIO_ACCOUNT_SID=AC... \
   TWILIO_AUTH_TOKEN=... \
-  TWILIO_FROM_NUMBER=+1XXXXXXXXXX
+  TWILIO_FROM_NUMBER=+1XXXXXXXXXX \
+  ADMIN_USERNAME=admin \
+  ADMIN_PASSWORD='pick-a-long-random-password'
 ```
 
 `TWILIO_FROM_NUMBER` is the salon voice number in E.164 — the same one
 callers dial. It's also the From: address on the ~24h appointment
 reminder SMS.
+
+`ADMIN_PASSWORD` enables HTTP Basic Auth on `/admin` and `/api`. Without
+it those paths are publicly reachable — always set this in production.
+The browser will prompt for username/password the first time you open
+`https://salon-poc.fly.dev/admin`.
 ### 4. First manual deploy
 
 Prove the container image builds and boots before hooking up CI:
@@ -395,7 +409,7 @@ behavior:
 | Kind | Where it goes | What belongs there |
 |---|---|---|
 | Public config | `[env]` in `fly.toml` | `HOST`, `PORT`, `SALON_DB_PATH`, `SALON_DATA_PATH`, `OPENAI_MODEL`, `DEEPGRAM_MODEL`, `PIPER_VOICE`, `LOG_LEVEL`, `SALON_TZ`, `REMINDER_POLL_SECONDS` — anything you'd be happy to see in a git diff. |
-| Actual secrets | `fly secrets set ...` | `OPENAI_API_KEY`, `DEEPGRAM_API_KEY`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` — anything that grants access if leaked (or identifies the number we send SMS from). |
+| Actual secrets | `fly secrets set ...` | `OPENAI_API_KEY`, `DEEPGRAM_API_KEY`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `ADMIN_USERNAME`, `ADMIN_PASSWORD` — anything that grants access if leaked. |
 
 We hit this the hard way once: `PORT` got set as a secret with an old
 value, which overrode the `PORT=8080` in `fly.toml`. The app listened
@@ -447,6 +461,7 @@ Something went wrong on a phone call. In order, check:
 | Export a spreadsheet backup of the live DB | `fly ssh console -a salon-poc -C "python -m export_xlsx /data/backup.xlsx"` then `fly ssh sftp get /data/backup.xlsx` |
 | Backfill clients from existing appointments (one-shot after Clients ships) | Dry run: `fly ssh console -a salon-poc -C "python -m backfill_clients"`. Write: `... -C "python -m backfill_clients --commit"` |
 | Set the SMS From number (required for reminders) | `fly secrets set TWILIO_FROM_NUMBER=+1XXXXXXXXXX -a salon-poc` (same E.164 number used for voice) |
+| Set admin login (required — locks /admin and /api) | `fly secrets set ADMIN_USERNAME=admin ADMIN_PASSWORD='...' -a salon-poc` |
 | Manually run one reminder tick | `fly ssh console -a salon-poc -C "python -c \"from reminders import run_reminder_tick; print(run_reminder_tick())\""` |
 | See what secrets are set (names only) | `fly secrets list -a salon-poc` |
 | Scale up to a bigger VM | `fly scale vm shared-cpu-2x --memory 2048` |
