@@ -40,8 +40,8 @@ import salon
 class TranscriptLogger(FrameProcessor):
     """Pass-through processor that logs what STT heard or what the LLM replied.
 
-    Writes to a "transcript"-tagged loguru sink (configured in server.py) so
-    the conversation log lands in logs/transcripts.log without the rest of the
+    Writes to a "transcript"-tagged loguru sink (configured in log_config.py) so
+    the conversation log lands in transcripts.log without the rest of the
     pipecat noise.
     """
 
@@ -231,6 +231,7 @@ async def run_bot(
     *,
     sample_rate: int,
     caller_phone: str | None = None,
+    call_sid: str | None = None,
 ) -> None:
     """Build and run the voice pipeline against an already-connected transport.
 
@@ -241,12 +242,19 @@ async def run_bot(
         caller_phone: Caller's phone number (E.164 or any format), extracted
             from the Twilio ``From`` field on inbound calls. ``None`` for the
             browser test transport, where there is no phone number.
+        call_sid: Twilio Call SID when this session is a phone call. Logged
+            next to ``session_id`` so ops can correlate with the Twilio console.
     """
     session_id = uuid.uuid4().hex[:8]
     normalized_caller = salon.normalize_phone(caller_phone) if caller_phone else None
-    logger.info(
-        f"Starting session {session_id} @ {sample_rate} Hz"
-        + (f" (caller={salon.format_phone(normalized_caller)})" if normalized_caller else "")
+    extras = []
+    if normalized_caller:
+        extras.append(f"caller={salon.format_phone(normalized_caller)}")
+    if call_sid:
+        extras.append(f"call_sid={call_sid}")
+    extra_str = f" ({', '.join(extras)})" if extras else ""
+    logger.bind(session=session_id, call_sid=call_sid or "").info(
+        f"Starting session {session_id} @ {sample_rate} Hz{extra_str}"
     )
 
     # VAD tuning: defaults (stop_secs=0.2) end the turn after just 200ms of

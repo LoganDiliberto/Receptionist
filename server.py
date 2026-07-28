@@ -16,85 +16,49 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, Request, WebSocket
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
-from fastapi.staticfiles import StaticFiles
-from loguru import logger
 
-from admin_api import router as admin_router
+# Load env, then arm loguru *before* importing salon/db/bot so their
+# import-time messages land in server.log (and on the /data volume in prod).
+load_dotenv()
 
-from pipecat.serializers.twilio import TwilioFrameSerializer
-from pipecat.transports.base_transport import BaseTransport, TransportParams
-from pipecat.transports.smallwebrtc.request_handler import (
+from log_config import configure_logging  # noqa: E402
+
+configure_logging()
+
+from fastapi import BackgroundTasks, FastAPI, Request, WebSocket  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import FileResponse, Response  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+from loguru import logger  # noqa: E402
+
+from admin_api import router as admin_router  # noqa: E402
+
+from pipecat.serializers.twilio import TwilioFrameSerializer  # noqa: E402
+from pipecat.transports.base_transport import BaseTransport, TransportParams  # noqa: E402
+from pipecat.transports.smallwebrtc.request_handler import (  # noqa: E402
     SmallWebRTCConnection,
     SmallWebRTCPatchRequest,
     SmallWebRTCRequest,
     SmallWebRTCRequestHandler,
 )
-from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
-from pipecat.transports.websocket.fastapi import (
+from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport  # noqa: E402
+from pipecat.transports.websocket.fastapi import (  # noqa: E402
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
 
-from bot import run_bot
-from auth import AdminBasicAuthMiddleware, log_auth_status
+from auth import AdminBasicAuthMiddleware, log_auth_status  # noqa: E402
+from bot import run_bot  # noqa: E402
 
-load_dotenv()
+log_auth_status()
 
 ROOT = Path(__file__).parent
 STATIC_DIR = ROOT / "static"
-LOG_DIR = ROOT / "logs"
-LOG_DIR.mkdir(exist_ok=True)
 # Built Angular admin app. Empty until you run `npm run build` in admin-ui/.
 ADMIN_DIST = ROOT / "admin-ui" / "dist" / "admin-ui" / "browser"
-
-
-def _is_transcript(record) -> bool:
-    return record["extra"].get("transcript") is True
-
-
-# Keep loguru's pre-configured stderr sink so existing console output is unchanged,
-# but stop transcript-tagged messages from echoing twice. Then add two file sinks.
-logger.remove()
-logger.add(
-    sys.stderr,
-    filter=lambda r: not _is_transcript(r),
-    level=os.getenv("LOG_LEVEL", "DEBUG"),
-)
-# Mirror transcript-tagged lines to stderr in a clean format too.
-logger.add(
-    sys.stderr,
-    filter=_is_transcript,
-    format="<green>{time:HH:mm:ss}</green> <cyan>[{extra[session]}]</cyan> "
-           "<level>{extra[role]:>9}</level>: {message}",
-    level="INFO",
-)
-# Full server log with rotation (10 MB, keep 5 files).
-logger.add(
-    LOG_DIR / "server.log",
-    rotation="10 MB",
-    retention=5,
-    enqueue=True,  # async-safe: another thread does the write
-    level="DEBUG",
-)
-# Dedicated conversation log — one line per turn, easy to grep.
-logger.add(
-    LOG_DIR / "transcripts.log",
-    filter=_is_transcript,
-    format="{time:YYYY-MM-DD HH:mm:ss} [{extra[session]}] {extra[role]:>9}: {message}",
-    rotation="5 MB",
-    retention=20,
-    enqueue=True,
-    level="INFO",
-)
-logger.info(f"Logging to {LOG_DIR}")
-log_auth_status()
 
 # WebRTC pipeline runs at 16 kHz (matches Whisper). Twilio Media Streams
 # are 8 kHz μ-law; the serializer handles encoding and resampling.
@@ -306,7 +270,12 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
         ),
     )
 
-    await _safe_run_bot(transport, TWILIO_SAMPLE_RATE, caller_phone=caller_phone)
+    await _safe_run_bot(
+        transport,
+        TWILIO_SAMPLE_RATE,
+        caller_phone=caller_phone,
+        call_sid=call_sid,
+    )
 
 
 # ---------- Shared ----------
@@ -370,9 +339,15 @@ async def _safe_run_bot(
     sample_rate: int,
     *,
     caller_phone: str | None = None,
+    call_sid: str | None = None,
 ) -> None:
     try:
-        await run_bot(transport, sample_rate=sample_rate, caller_phone=caller_phone)
+        await run_bot(
+            transport,
+            sample_rate=sample_rate,
+            caller_phone=caller_phone,
+            call_sid=call_sid,
+        )
     except asyncio.CancelledError:
         raise
     except Exception:

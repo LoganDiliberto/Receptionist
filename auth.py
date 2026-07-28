@@ -97,6 +97,9 @@ class AdminBasicAuthMiddleware(BaseHTTPMiddleware):
 
         provided = _parse_basic(request.headers.get("authorization"))
         if provided is None:
+            logger.warning(
+                f"Admin auth failed: missing credentials path={request.url.path}"
+            )
             return _unauthorized()
 
         exp_user, exp_pass = expected
@@ -104,6 +107,10 @@ class AdminBasicAuthMiddleware(BaseHTTPMiddleware):
         user_ok = secrets.compare_digest(got_user, exp_user)
         pass_ok = secrets.compare_digest(got_pass, exp_pass)
         if not (user_ok and pass_ok):
+            logger.warning(
+                f"Admin auth failed: bad credentials user={got_user!r} "
+                f"path={request.url.path}"
+            )
             return _unauthorized()
 
         return await call_next(request)

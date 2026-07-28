@@ -26,9 +26,13 @@ primary_region = "iad"
   SALON_DATA_PATH = "/data/ReceptionistData.xlsx"
   SALON_TZ = "America/New_York"
   REMINDER_POLL_SECONDS = "300"
+  # File logs on the persistent volume so transcripts survive redeploys
+  # (admin Calls UI reads the same path via log_config.LOG_DIR).
+  LOG_DIR = "/data/logs"
+  LOG_LEVEL = "INFO"
 
-# Persistent, per-machine volume for the SQLite DB (and the legacy xlsx
-# for one-shot migration on the very first Phase 1 boot). Create it once:
+# Persistent volume for the SQLite DB and file logs (`LOG_DIR=/data/logs`).
+# Create it once:
 #   fly volumes create receptionist_data --region iad --size 1
 [mounts]
   source = "receptionist_data"
