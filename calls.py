@@ -1,10 +1,10 @@
 """Call observability: turn the transcript log into structured call records.
 
-The bot writes one line per turn to `logs/transcripts.log` in a fixed loguru
-format defined in `server.py`:
+The bot writes one line per turn to ``transcripts.log`` (under ``LOG_DIR``
+from ``log_config``) in a fixed loguru format:
 
     2026-06-29 10:36:43 [4ce16399]      user:  Welcome
-    2026-06-29 10:36:46 [4ce16399] assistant: What can I help you with today?
+    2026-06-29 10:36:46 [4ce16399] assistant: What can I help with today?
 
 We parse every rotated log file plus the live one, group lines by session id,
 compute a rough start/end/duration, and try to link each call to appointments
@@ -16,11 +16,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 
 import salon
+from log_config import LOG_DIR
 
-LOG_DIR = Path(__file__).parent / "logs"
 TRANSCRIPT_GLOB = "transcripts.log*"
 
 # Loguru pads role to 9 chars right-aligned, which means "user" comes through

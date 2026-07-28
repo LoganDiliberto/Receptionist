@@ -81,6 +81,7 @@ instead of a phone, so you can test changes without making a phone call.
 |---|---|
 | `server.py` | The web server. Accepts incoming calls (from the browser or from Twilio), sets up a transport for each call, and starts a bot to run the conversation. Also serves the admin UI and its REST API. |
 | `auth.py` | HTTP Basic Auth middleware that gates `/admin` and `/api` when `ADMIN_PASSWORD` is set. Voice (`/voice`, `/twilio/ws`) and the browser test client stay public. |
+| `log_config.py` | Shared Loguru setup: `LOG_DIR`, rotation/retention, and stdlib interception so uvicorn/pipecat land in the same files. |
 | `run.py` | Convenience launcher: spawns `server.py` and `ngrok http 7860` together and prints the public URL you paste into Twilio. Also `run.cmd` for a shorter double-click / one-word invocation on Windows. |
 | `bot.py` | Defines the voice pipeline — the chain of components that turn caller audio into a reply. Transport-agnostic, so the same bot works for browser tests and real phone calls. When a caller's phone number is known, `bot.py` injects their name and appointment history into the system prompt so the LLM greets returning callers by name. |
 | `salon.py` | The salon data layer. Reads and writes the SQLite database (hours, staff, services, schedules, appointments, **clients**) via SQLAlchemy and exposes the async tools (`check_availability`, `book_appointment`) the LLM calls, plus CRUD helpers used by the admin API. Includes `normalize_phone` / `format_phone` and the `caller_context()` block that gets injected into the bot's system prompt on each call. |
@@ -90,13 +91,13 @@ instead of a phone, so you can test changes without making a phone call.
 | `import_xlsx.py` / `export_xlsx.py` | One-shot CLIs to move data between the legacy `ReceptionistData.xlsx` and the SQLite database. Only used for onboarding a new salon or debugging — the running server touches only the DB. |
 | `backfill_clients.py` | Post-Phase-2 one-shot: creates `Client` rows for each unique `Appointment.customer_phone` in the DB and links appointments to them. Idempotent — safe to re-run. Dry-run by default; pass `--commit` to write. |
 | `reminders.py` | Outbound appointment SMS (~24h before start) via Twilio. An in-process poller in `server.py` calls `run_reminder_tick` every few minutes. Status is stored on each appointment (`pending` / `sent` / `failed` / `skipped`). |
-| `calls.py` | Parses `logs/transcripts.log` into structured call records and links each call to the appointment it produced (via the `session_id` column). |
+| `calls.py` | Parses `transcripts.log` (under `LOG_DIR`) into structured call records and links each call to the appointment it produced (via the `session_id` column). |
 | `admin_api.py` | FastAPI router mounted at `/api` that exposes staff/services/hours/appointments/**clients**/calls to the admin UI. |
 | `admin-ui/` | Angular admin console (built with `npm run build`; served by FastAPI at `/admin`). |
 | `static/index.html` | A small webpage that lets you "call" the bot from your browser for testing. |
 | `voices/` | The Piper text-to-speech voice files. Not committed (see `.gitignore`) — Piper auto-downloads the voice named by `PIPER_VOICE` on first synthesis, and the Docker build pre-bakes it so the first call has no download latency. |
-| `logs/server.log` | Everything the program logs, rotated. Useful when something breaks. |
-| `logs/transcripts.log` | Just the conversation transcripts. One line per turn. Useful for tuning. |
+| `logs/server.log` | Everything the program logs, rotated. Local default under `./logs`; on Fly this is `/data/logs/server.log`. |
+| `logs/transcripts.log` | Just the conversation transcripts. One line per turn. Same `LOG_DIR` as above — survives redeploys on Fly. |
 | `.env` | Secrets and settings: your OpenAI API key, Deepgram API key, Twilio credentials, model choices. Not committed to git. |
 | `.env.example` | A template showing what `.env` should contain. |
 | `Dockerfile` / `.dockerignore` | How production builds the container image (multi-stage: Angular build + Python runtime). |
@@ -240,17 +241,18 @@ origins). Easiest options: leave `ADMIN_PASSWORD` unset while using
   Each row shows when the call happened, how long it lasted, how many turns
   it took, and whether it resulted in a booking. Click a row for the full
   transcript and a "view in calendar" link to any appointment the call
-  produced. Data is derived from `logs/transcripts.log` plus the
+  produced. Data is derived from `transcripts.log` (see `LOG_DIR`) plus the
   `session_id` column the bot now stamps on every appointment it books.
 
 ---
 
 ## How to tune it when it goes wrong
 
-Watch `logs/transcripts.log` locally, or `fly logs -a salon-poc` in
-production. You'll see what the program actually heard you say and what
-it actually replied. In production, the **Calls** page in the admin UI
-also gives you a per-call transcript view. From there:
+Watch `logs/transcripts.log` locally (or `/data/logs/transcripts.log` on
+Fly), or `fly logs -a salon-poc` for the live stream. You'll see what the
+program actually heard you say and what it actually replied. In production,
+the **Calls** page in the admin UI also gives you a per-call transcript
+view. From there:
 
 - **It heard the wrong words.** Try a phone-tuned Deepgram model —
   `DEEPGRAM_MODEL=nova-2-phonecall` is trained specifically on
@@ -408,7 +410,7 @@ behavior:
 
 | Kind | Where it goes | What belongs there |
 |---|---|---|
-| Public config | `[env]` in `fly.toml` | `HOST`, `PORT`, `SALON_DB_PATH`, `SALON_DATA_PATH`, `OPENAI_MODEL`, `DEEPGRAM_MODEL`, `PIPER_VOICE`, `LOG_LEVEL`, `SALON_TZ`, `REMINDER_POLL_SECONDS` — anything you'd be happy to see in a git diff. |
+| Public config | `[env]` in `fly.toml` | `HOST`, `PORT`, `SALON_DB_PATH`, `SALON_DATA_PATH`, `OPENAI_MODEL`, `DEEPGRAM_MODEL`, `PIPER_VOICE`, `LOG_DIR`, `LOG_LEVEL`, `SALON_TZ`, `REMINDER_POLL_SECONDS` — anything you'd be happy to see in a git diff. |
 | Actual secrets | `fly secrets set ...` | `OPENAI_API_KEY`, `DEEPGRAM_API_KEY`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `ADMIN_USERNAME`, `ADMIN_PASSWORD` — anything that grants access if leaked. |
 
 We hit this the hard way once: `PORT` got set as a secret with an old
@@ -456,6 +458,7 @@ Something went wrong on a phone call. In order, check:
 | Task | Command |
 |---|---|
 | Tail production logs | `fly logs -a salon-poc` |
+| Inspect persisted log files on the volume | `fly ssh console -a salon-poc -C "ls -la /data/logs"` |
 | Open a shell in the running container | `fly ssh console -a salon-poc` |
 | Roll back to the previous release | `fly releases -a salon-poc` then `fly deploy --image <previous-image-ref>` |
 | Export a spreadsheet backup of the live DB | `fly ssh console -a salon-poc -C "python -m export_xlsx /data/backup.xlsx"` then `fly ssh sftp get /data/backup.xlsx` |
@@ -477,10 +480,10 @@ Something went wrong on a phone call. In order, check:
   `/data/ReceptionistData.xlsx.imported`.
 - **Piper voice**: `/app/voices/en_US-amy-medium.onnx` — pre-baked into
   the image at build time by the Dockerfile.
-- **Logs**: `/app/logs/*.log` inside the container (rotated), plus everything
-  streams to Fly's log service (queryable via `fly logs`). If you want the
-  transcript log to survive redeploys, move `LOG_DIR` to `/data/logs/` in
-  `server.py`.
+- **Logs**: `/data/logs/*.log` on the persistent volume (`LOG_DIR` in
+  `fly.toml`). Rotated by size; retained ~14 days (`server.log`) /
+  ~30 days (`transcripts.log`). Also streamed to Fly's log service
+  (`fly logs`). Locally, defaults to `./logs`.
 
 ---
 

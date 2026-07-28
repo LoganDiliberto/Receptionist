@@ -45,7 +45,7 @@ RUN mkdir -p /app/voices \
        download_voice('${PIPER_VOICE}', Path('/app/voices'))"
 
 # App source (order matters for cache: most-frequently-changed files last).
-COPY salon.py db.py models.py admin_api.py calls.py bot.py server.py auth.py entrypoint.sh ./
+COPY salon.py db.py models.py admin_api.py calls.py bot.py server.py auth.py log_config.py entrypoint.sh ./
 COPY import_xlsx.py export_xlsx.py backfill_clients.py reminders.py ./
 COPY alembic.ini ./
 COPY alembic/ ./alembic/
@@ -59,7 +59,7 @@ COPY ReceptionistData.xlsx ./ReceptionistData.xlsx.seed
 COPY --from=admin-ui-build /admin-ui/dist/admin-ui/browser/ ./admin-ui/dist/admin-ui/browser/
 
 RUN chmod +x /app/entrypoint.sh \
-    && mkdir -p /data /app/logs
+    && mkdir -p /data /data/logs /app/logs
 
 # Fly.io defaults to $PORT=8080, but our server also honors $PORT — no hardcoded value.
 ENV HOST=0.0.0.0 \
