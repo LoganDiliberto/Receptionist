@@ -283,6 +283,13 @@ def _appt_to_dict(a: Appointment) -> dict:
             if a.client is not None
             else None
         ),
+        "reminder_status": getattr(a, "reminder_status", None) or "pending",
+        "reminder_sent_at": (
+            a.reminder_sent_at.isoformat(timespec="seconds")
+            if getattr(a, "reminder_sent_at", None)
+            else None
+        ),
+        "reminder_error": getattr(a, "reminder_error", None),
     }
 
 

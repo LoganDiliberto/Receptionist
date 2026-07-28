@@ -40,6 +40,10 @@ export interface Appointment {
   // Phase 2 additions — appointments now optionally link to a Client.
   client_id?: number | null;
   client?: ClientSummary | null;
+  // Outbound SMS reminder (~24h before). pending | sent | failed | skipped
+  reminder_status?: 'pending' | 'sent' | 'failed' | 'skipped' | string;
+  reminder_sent_at?: string | null;
+  reminder_error?: string | null;
 }
 
 export interface AppointmentPayload {

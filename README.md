@@ -88,6 +88,7 @@ instead of a phone, so you can test changes without making a phone call.
 | `alembic/` | Schema migrations. `alembic upgrade head` runs automatically on every container boot (see `entrypoint.sh`). |
 | `import_xlsx.py` / `export_xlsx.py` | One-shot CLIs to move data between the legacy `ReceptionistData.xlsx` and the SQLite database. Only used for onboarding a new salon or debugging — the running server touches only the DB. |
 | `backfill_clients.py` | Post-Phase-2 one-shot: creates `Client` rows for each unique `Appointment.customer_phone` in the DB and links appointments to them. Idempotent — safe to re-run. Dry-run by default; pass `--commit` to write. |
+| `reminders.py` | Outbound appointment SMS (~24h before start) via Twilio. An in-process poller in `server.py` calls `run_reminder_tick` every few minutes. Status is stored on each appointment (`pending` / `sent` / `failed` / `skipped`). |
 | `calls.py` | Parses `logs/transcripts.log` into structured call records and links each call to the appointment it produced (via the `session_id` column). |
 | `admin_api.py` | FastAPI router mounted at `/api` that exposes staff/services/hours/appointments/**clients**/calls to the admin UI. |
 | `admin-ui/` | Angular admin console (built with `npm run build`; served by FastAPI at `/admin`). |
@@ -226,7 +227,8 @@ in `server.py`.
   day to add a new booking, or click an existing appointment to edit or
   cancel it. Uses the same conflict-detection logic the voice bot does.
   When an appointment is linked to a client, the editor shows a
-  "Linked to client" badge below the phone field.
+  "Linked to client" badge below the phone field. Each appointment also
+  shows its SMS reminder status (pending / sent / failed).
 - **Calls** — an observability view of every call the bot has answered.
   Each row shows when the call happened, how long it lasted, how many turns
   it took, and whether it resulted in a booking. Click a row for the full
@@ -335,9 +337,13 @@ fly secrets set \
   OPENAI_API_KEY=sk-... \
   DEEPGRAM_API_KEY=... \
   TWILIO_ACCOUNT_SID=AC... \
-  TWILIO_AUTH_TOKEN=...
+  TWILIO_AUTH_TOKEN=... \
+  TWILIO_FROM_NUMBER=+1XXXXXXXXXX
 ```
 
+`TWILIO_FROM_NUMBER` is the salon voice number in E.164 — the same one
+callers dial. It's also the From: address on the ~24h appointment
+reminder SMS.
 ### 4. First manual deploy
 
 Prove the container image builds and boots before hooking up CI:
@@ -388,8 +394,8 @@ behavior:
 
 | Kind | Where it goes | What belongs there |
 |---|---|---|
-| Public config | `[env]` in `fly.toml` | `HOST`, `PORT`, `SALON_DATA_PATH`, `OPENAI_MODEL`, `DEEPGRAM_MODEL`, `PIPER_VOICE`, `LOG_LEVEL` — anything you'd be happy to see in a git diff. |
-| Actual secrets | `fly secrets set ...` | `OPENAI_API_KEY`, `DEEPGRAM_API_KEY`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` — anything that grants access if leaked. |
+| Public config | `[env]` in `fly.toml` | `HOST`, `PORT`, `SALON_DB_PATH`, `SALON_DATA_PATH`, `OPENAI_MODEL`, `DEEPGRAM_MODEL`, `PIPER_VOICE`, `LOG_LEVEL`, `SALON_TZ`, `REMINDER_POLL_SECONDS` — anything you'd be happy to see in a git diff. |
+| Actual secrets | `fly secrets set ...` | `OPENAI_API_KEY`, `DEEPGRAM_API_KEY`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` — anything that grants access if leaked (or identifies the number we send SMS from). |
 
 We hit this the hard way once: `PORT` got set as a secret with an old
 value, which overrode the `PORT=8080` in `fly.toml`. The app listened
@@ -440,6 +446,8 @@ Something went wrong on a phone call. In order, check:
 | Roll back to the previous release | `fly releases -a salon-poc` then `fly deploy --image <previous-image-ref>` |
 | Export a spreadsheet backup of the live DB | `fly ssh console -a salon-poc -C "python -m export_xlsx /data/backup.xlsx"` then `fly ssh sftp get /data/backup.xlsx` |
 | Backfill clients from existing appointments (one-shot after Clients ships) | Dry run: `fly ssh console -a salon-poc -C "python -m backfill_clients"`. Write: `... -C "python -m backfill_clients --commit"` |
+| Set the SMS From number (required for reminders) | `fly secrets set TWILIO_FROM_NUMBER=+1XXXXXXXXXX -a salon-poc` (same E.164 number used for voice) |
+| Manually run one reminder tick | `fly ssh console -a salon-poc -C "python -c \"from reminders import run_reminder_tick; print(run_reminder_tick())\""` |
 | See what secrets are set (names only) | `fly secrets list -a salon-poc` |
 | Scale up to a bigger VM | `fly scale vm shared-cpu-2x --memory 2048` |
 | Restart the machine (no rebuild) | `fly apps restart salon-poc` |
