@@ -208,6 +208,14 @@ class Appointment(Base):
     end_time: Mapped[time] = mapped_column(Time, nullable=False)
     session_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # Outbound SMS reminder (~24h before start). See reminders.py.
+    # Values: pending | sent | failed | skipped
+    reminder_status: Mapped[str] = mapped_column(
+        String, nullable=False, default="pending"
+    )
+    reminder_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reminder_error: Mapped[str | None] = mapped_column(String, nullable=True)
+
     staff: Mapped[Staff] = relationship(Staff, lazy="joined")
     service: Mapped[Service] = relationship(Service, lazy="joined")
     client: Mapped[Client | None] = relationship(

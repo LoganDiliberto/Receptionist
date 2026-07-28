@@ -15,6 +15,12 @@ loguru==0.7.3
 # asyncio.to_thread. SQLite ships with Python — no extra driver needed.
 SQLAlchemy==2.0.36
 alembic==1.14.0
+# IANA timezone data so ZoneInfo("America/New_York") works on every OS
+# (Windows hosts and slim Linux images don't always ship system zoneinfo).
+tzdata==2025.2
+
+# Twilio — voice Media Streams (already used) plus outbound SMS reminders.
+twilio==9.6.0
 
 # openpyxl is now only used by the one-shot xlsx import/export CLIs,
 # not by the running server. Kept in the runtime image so `python -m

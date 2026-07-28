@@ -130,6 +130,11 @@ interface DialogData {
                   <div class="appt" (click)="edit(a)">
                     <div class="appt-time">
                       {{ a.start_time }}<span *ngIf="a.end_time">–{{ a.end_time }}</span>
+                      @if (a.reminder_status === 'sent') {
+                        <mat-icon class="reminder-icon sent" matTooltip="Reminder sent">sms</mat-icon>
+                      } @else if (a.reminder_status === 'failed') {
+                        <mat-icon class="reminder-icon failed" matTooltip="Reminder failed">sms_failed</mat-icon>
+                      }
                     </div>
                     <div class="appt-customer">{{ a.customer_name }}</div>
                     <div class="appt-detail">
@@ -229,6 +234,20 @@ interface DialogData {
         font-weight: 500;
         font-size: 13px;
         color: #1d4ed8;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+      .reminder-icon {
+        font-size: 14px;
+        width: 14px;
+        height: 14px;
+      }
+      .reminder-icon.sent {
+        color: #059669;
+      }
+      .reminder-icon.failed {
+        color: #dc2626;
       }
       .appt-customer {
         font-size: 13px;
@@ -383,6 +402,7 @@ export class CalendarComponent implements OnInit {
     MatIconModule,
     MatInputModule,
     MatSelectModule,
+    MatTooltipModule,
   ],
   template: `
     <h2 mat-dialog-title>
@@ -405,6 +425,19 @@ export class CalendarComponent implements OnInit {
             <span>Linked to client:</span>
             <strong>{{ c.first_name }} {{ c.last_name }}</strong>
             <span class="muted">({{ c.phone_formatted }})</span>
+          </div>
+        }
+
+        @if (data.appointment; as a) {
+          <div class="reminder-badge" [attr.data-status]="a.reminder_status || 'pending'">
+            <mat-icon>{{ reminderIcon(a.reminder_status) }}</mat-icon>
+            <span>{{ reminderLabel(a.reminder_status) }}</span>
+            @if (a.reminder_sent_at) {
+              <span class="muted">· {{ a.reminder_sent_at }}</span>
+            }
+            @if (a.reminder_status === 'failed' && a.reminder_error) {
+              <span class="muted" [matTooltip]="a.reminder_error">· see error</span>
+            }
           </div>
         }
 
@@ -499,6 +532,38 @@ export class CalendarComponent implements OnInit {
           color: #6b7280;
         }
       }
+      .reminder-badge {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 10px;
+        margin: -4px 0 4px 0;
+        background: rgba(107, 114, 128, 0.08);
+        color: #374151;
+        border-radius: 6px;
+        font-size: 13px;
+
+        mat-icon {
+          font-size: 16px;
+          width: 16px;
+          height: 16px;
+        }
+        .muted {
+          color: #6b7280;
+        }
+        &[data-status='sent'] {
+          background: rgba(5, 150, 105, 0.08);
+          color: #047857;
+        }
+        &[data-status='failed'] {
+          background: rgba(220, 38, 38, 0.08);
+          color: #b91c1c;
+        }
+        &[data-status='skipped'] {
+          background: rgba(245, 158, 11, 0.1);
+          color: #b45309;
+        }
+      }
     `,
   ],
 })
@@ -524,6 +589,32 @@ export class AppointmentDialogComponent {
       date: fb.nonNullable.control(a?.date ?? data.defaultDate ?? toIso(new Date()), Validators.required),
       start_time: fb.nonNullable.control(a?.start_time ?? '10:00', Validators.required),
     });
+  }
+
+  reminderLabel(status: string | null | undefined): string {
+    switch (status) {
+      case 'sent':
+        return 'Reminder sent';
+      case 'failed':
+        return 'Reminder failed';
+      case 'skipped':
+        return 'Reminder skipped (no phone)';
+      default:
+        return 'Reminder pending (sends ~24h before)';
+    }
+  }
+
+  reminderIcon(status: string | null | undefined): string {
+    switch (status) {
+      case 'sent':
+        return 'sms';
+      case 'failed':
+        return 'sms_failed';
+      case 'skipped':
+        return 'phonelink_erase';
+      default:
+        return 'schedule_send';
+    }
   }
 
   save(): void {

@@ -24,6 +24,8 @@ primary_region = "iad"
   # Kept for backwards compat with volumes provisioned before Phase 1 —
   # entrypoint.sh reads from this path exactly once, then renames the file.
   SALON_DATA_PATH = "/data/ReceptionistData.xlsx"
+  SALON_TZ = "America/New_York"
+  REMINDER_POLL_SECONDS = "300"
 
 # Persistent, per-machine volume for the SQLite DB (and the legacy xlsx
 # for one-shot migration on the very first Phase 1 boot). Create it once:

@@ -303,8 +303,56 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
 # ---------- Shared ----------
 
 
+_reminder_task: asyncio.Task | None = None
+
+
+async def _reminder_loop() -> None:
+    """Background poller: every REMINDER_POLL_SECONDS, try to send due SMS reminders.
+
+    Never raises out of the loop — a bad Twilio tick must not take down the
+    voice server. See reminders.py for the selection + send logic.
+    """
+    poll_seconds = int(os.getenv("REMINDER_POLL_SECONDS", "300"))
+    # Small delay so the first tick doesn't race alembic / import on boot.
+    await asyncio.sleep(15)
+    logger.info(f"Reminder poller started (every {poll_seconds}s)")
+    while True:
+        try:
+            summary = await asyncio.to_thread(_run_reminder_tick)
+            if summary.get("due"):
+                logger.info(f"Reminder tick result: {summary}")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Reminder tick crashed; will retry next cycle")
+        try:
+            await asyncio.sleep(poll_seconds)
+        except asyncio.CancelledError:
+            raise
+
+
+def _run_reminder_tick() -> dict:
+    # Local import keeps server.py importable even if reminders deps shift.
+    from reminders import run_reminder_tick
+    return run_reminder_tick()
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    global _reminder_task
+    _reminder_task = asyncio.create_task(_reminder_loop(), name="reminder-poller")
+
+
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    global _reminder_task
+    if _reminder_task is not None:
+        _reminder_task.cancel()
+        try:
+            await _reminder_task
+        except asyncio.CancelledError:
+            pass
+        _reminder_task = None
     await webrtc_handler.close()
 
 
