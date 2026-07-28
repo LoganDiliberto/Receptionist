@@ -51,8 +51,8 @@ primary_region = "iad"
     soft_limit = 20
     hard_limit = 40
 
-# A tiny VM is fine to start — Deepgram STT and OpenAI LLM are the
-# compute-heavy parts and both run in the cloud, not on this box.
+# Piper TTS + Silero VAD are local ONNX models loaded in-process. 1 GB was
+# enough at idle but OOMs mid-call (~850 MB RSS). 2 GB gives headroom.
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "1gb"
+  memory = "2gb"
