@@ -2,6 +2,10 @@
 An AI receptionist that answers a phone. Someone calls a real phone number, the
 AI picks up, has a real conversation with them, takes a message, and hangs up.
 
+Architecture, data model, call flow, and design trade-offs are in
+[DESIGN.md](DESIGN.md). This README covers how to run, deploy, and operate
+the app.
+
 ---
 
 ## What it does, in one paragraph
